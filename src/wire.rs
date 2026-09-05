@@ -479,9 +479,17 @@ pub fn refresh_family(b: &[u8], n: &Negotiated) -> Result<Option<bool>> {
         _ => Ok(None),
     }
 }
-pub fn unexpected(kind: u8) -> anyhow::Error {
+pub fn unexpected(kind: u8, body: &[u8]) -> anyhow::Error {
     if kind == 3 {
-        anyhow::anyhow!("peer sent NOTIFICATION")
+        if body.len() >= 2 {
+            anyhow::anyhow!(
+                "peer sent NOTIFICATION code={} subcode={}",
+                body[0],
+                body[1]
+            )
+        } else {
+            anyhow::anyhow!("peer sent truncated NOTIFICATION")
+        }
     } else {
         err(5, 0, "unexpected message in BGP state")
     }

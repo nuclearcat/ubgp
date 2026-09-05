@@ -11,7 +11,20 @@ ASNs, interface, table selection and prefix rules before deployment.
 ```sh
 ubgp --config /etc/ubgp.toml --check-config
 ubgp --config /etc/ubgp.toml
+ubgp --daemon --config /etc/ubgp.toml
 ```
+
+`-c PATH` and `--config=PATH` also select the configuration file; `-d` is an
+alias for `--daemon`. See `ubgp --help` for all flags. `--check-config` always
+validates and exits in the foreground, even when combined with `--daemon`.
+
+Background mode validates configuration before detaching, changes directory
+to `/`, redirects standard streams to `/dev/null`, and sends logs to syslog
+as `ubgp` with facility `daemon` and the appropriate severity. Configure a
+syslog receiver on the machine to collect these logs. Relative configuration
+paths continue to work for SIGHUP reloads. The launcher exits after detaching;
+later runtime failures, such as a failed listener bind, are reported to syslog.
+Use foreground mode with the supplied systemd service or a container supervisor.
 
 ## Export policy
 
@@ -61,10 +74,75 @@ automatically; `next_hop_v6_link_local` can explicitly select one.
 Link-local IPv6 peer addresses are supported; `interface` supplies their scope.
 RFC 8950 extended next hops are not negotiated.
 
+At the default log level, ubgp reports outgoing Connect attempts, TCP connection
+acceptance/completion, OpenSent, OpenConfirm, Established, and retry delays.
+Routine kernel snapshots and export synchronization are debug-only to avoid
+route-churn log floods. Enable them with `ubgp --debug` or
+`ubgp --daemon --debug`; `--debug` overrides `RUST_LOG` with `ubgp=debug`.
+Without the flag, `RUST_LOG` remains available for custom filtering.
+Failure warnings include the underlying error chain;
+connection warnings also identify the local address, interface, destination port,
+and whether MD5 is enabled. Received BGP NOTIFICATIONs include code and subcode.
+Foreground logs go to stdout; `--daemon` logs go to syslog. A TCP timeout by itself
+does not distinguish a wrong MD5 key from filtering or an unreachable peer.
+
+Optional TCP-MD5 authentication is configured separately on each peer:
+
+```toml
+md5_password = "replace-with-shared-secret"
+```
+
+Use the same key at both ends. Keys contain 1–80 UTF-8 bytes; an empty key is
+rejected. Omit the field for unauthenticated sessions. IPv4 and IPv6 transports,
+active connections, incoming connections, and different keys on a shared
+listener are supported. Linux installs/verifies TCP signatures before BGP
+starts. Key installation failures never fall back to unauthenticated TCP.
+The kernel must support `CONFIG_TCP_MD5SIG`.
+
+Changing or removing a key uses the normal SIGHUP reload and reconnects peers;
+coordinate key changes at both ends. The key is stored in the TOML file, so
+restrict that file to the service account/group. Keys are redacted from Debug
+output; TOML parse errors report location without quoting configuration values.
+
 Received UPDATEs are bounded and structurally validated, then discarded.
 Malformed protocol messages can reset the session. This is an exporter, not
 a complete routing daemon: there is no best-path selection, route reflection,
-ADD-PATH, TCP-MD5/AO, BFD, graceful restart, VPN/EVPN, or forwarding-plane writes.
+ADD-PATH, TCP-AO, BFD, graceful restart, VPN/EVPN, or forwarding-plane writes.
+
+## Management console
+
+The read-only console is enabled by default on `127.0.0.1:65090`:
+
+```sh
+telnet 127.0.0.1 65090
+```
+
+Commands: `help`, `show summary`, `show peers`, `show routes ACL [PREFIX]`,
+and `quit`/`exit`. For example, `show routes firewall 100.64.1.2/32` looks up
+an exact prefix in the `firewall` ACL export candidates. `show summary` lists
+the ACL names and candidate counts. `show peers` reports state, seconds in
+that state, MD5 enabled/disabled, and the most recent failure (retained after
+reconnection). Keys are never displayed. States reset on configuration reload.
+
+Route queries show the current ACL-filtered kernel snapshot, not the peer's
+advertised RIB; family negotiation and connection state can further restrict
+exports. Unfiltered listings show at most 100 unordered prefixes. Prefix
+lookups are exact, not longest-prefix matches.
+
+Optional configuration:
+
+```toml
+[management]
+enabled = true
+listen = "127.0.0.1:65090"
+```
+
+Use `enabled = false` to disable the console. Only loopback addresses are
+accepted; the console has no authentication and is accessible to local users.
+It supports basic Telnet negotiation and line editing with backspace, as well
+as plain TCP clients. Limits are 16 concurrent clients, 512 command bytes,
+a five-minute command input deadline, and a five-second write timeout.
+SIGHUP closes console connections and applies the new listener settings.
 
 ## Netlink recovery and resource use
 
@@ -125,7 +203,7 @@ docker build -f tests/Dockerfile -t ubgp-test .
 # Formatting, Clippy, unit tests, and example configuration validation:
 docker run --rm --network none ubgp-test unit
 
-# Live kernel, eBGP/iBGP, IPv4/IPv6, BIRD and netlink-loss tests:
+# Live kernel, eBGP/iBGP, IPv4/IPv6, TCP-MD5, BIRD and netlink-loss tests:
 docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_ADMIN \
   --pids-limit 256 ubgp-test integration
 
@@ -147,6 +225,10 @@ duplicate routes, route-type replacement, withdrawals, IPv6, active/incoming
 connections, simultaneous connections, four-byte ASNs, invalid ACL reloads,
 capacity-triggered stale withdrawal, and actual receive-buffer overflow by
 pausing ubgp while flooding kernel routes.
+TCP-MD5 tests cover IPv4/IPv6 active and incoming sessions, wrong or missing
+keys, SIGHUP key rotation/removal, and distinct authenticated and unauthenticated
+peers sharing a listener. To run only these tests, use `md5` instead of
+`integration` with the same Docker options.
 
 To export the Docker-built release binary without running tests on the host:
 
@@ -170,9 +252,9 @@ Runtime failures such as an unavailable bind address cause startup failure;
 configuration validation does not reserve sockets or verify the live network.
 SIGTERM/SIGINT closes sessions and stops workers.
 
-Logs expose buffer sizing, successful dump count, prefix count, dump duration,
-notification loss, retries, stale withdrawals and session state. Set
-`RUST_LOG=ubgp=debug` for connection-candidate diagnostics.
+Default logs expose buffer sizing, notification loss, retries, stale withdrawals
+and session state. Use `--debug` for successful dump counts, prefix counts,
+dump durations, export synchronization and connection-candidate diagnostics.
 
 Protocol references: [BGP-4](https://www.rfc-editor.org/rfc/rfc4271.html),
 [multiprotocol BGP](https://www.rfc-editor.org/rfc/rfc4760.html),

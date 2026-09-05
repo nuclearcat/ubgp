@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -84,12 +85,15 @@ class Lab:
                 p.kill()
                 p.wait(timeout=5)
 
-    def configure(self, mode="outgoing", local_as=64512, remote_as=64513, v6_transport=False, maximum=64):
+    def configure(self, mode="outgoing", local_as=64512, remote_as=64513, v6_transport=False, maximum=64,
+                  md5_password=None, bird_password=None, expect_established=True):
         self.stop(self.ubgp)
         self.stop(self.bird)
         self.mode = mode
         local = "2001:db8:ffff::1" if v6_transport else "192.0.2.1"
         remote = "2001:db8:ffff::2" if v6_transport else "192.0.2.2"
+        md5_config = f'md5_password = "{md5_password}"' if md5_password is not None else ""
+        bird_auth = f'password "{bird_password}";' if bird_password is not None else ""
         self.config = f'''asn = {local_as}
 router_id = "192.0.2.1"
 ipv6 = true
@@ -115,6 +119,7 @@ local_address = "{local}"
 interface = "ubgp0"
 remote_asn = {remote_as}
 export_acl = "export"
+{md5_config}
 port = {9999 if mode == "incoming" else 2179}
 hold_time_secs = 180
 connect_timeout_secs = 3
@@ -138,6 +143,7 @@ protocol bgp ubgp {{
  error wait time 1, 2;
  hold time 180;
  graceful restart off;
+ {bird_auth}
  ipv4 {{ import all; export filter {{ if net = 198.51.100.0/24 then accept; reject; }}; extended next hop off; }};
  ipv6 {{ import all; export none; }};
 }}
@@ -149,8 +155,26 @@ protocol bgp ubgp {{
                                "-c", str(self.path / "bird.conf"), "-s", str(self.path / "bird.ctl"),
                                "-P", str(self.path / "bird.pid"))
         self.ubgp = self.spawn("ubgp", "/work/target/release/ubgp", "--config", str(self.path / "ubgp.toml"))
+        if not expect_established:
+            return
         wait_for(f"{mode} BGP Established", lambda: "Established" in self.control("show protocols all ubgp"))
+        for event in ["BGP TCP connected", "BGP OpenSent", "BGP OpenConfirm", "BGP Established"]:
+            wait_for(f"lifecycle log: {event}", lambda event=event: event in (self.path / "ubgp.log").read_text())
         wait_for("connected IPv4 prefix", lambda: self.has("198.18.1.0/24"))
+        with socket.create_connection(("127.0.0.1", 65090), timeout=3) as console:
+            def response():
+                data = b""
+                while not data.endswith(b"ubgp> "):
+                    chunk = console.recv(4096)
+                    assert chunk, data
+                    data += chunk
+                return data.decode()
+            response()
+            console.sendall(b"show peers\r\n")
+            assert "Established" in response()
+            console.sendall(b"show routes export 198.18.1.0/24\r\n")
+            assert "198.18.1.0/24" in response()
+        print("PASS management shows Established and ACL export candidate", flush=True)
         wait_for("selected-table IPv4 prefix", lambda: self.has("10.1.0.0/24"))
         wait_for("IPv6 MP_REACH prefix", lambda: self.has("2001:db8:100::/48"))
 
@@ -256,31 +280,36 @@ protocol bgp ubgp {{
             h.close()
 
 
-with tempfile.TemporaryDirectory(prefix="ubgp-tests-") as directory:
-    lab = None
-    try:
-        lab = Lab(directory)
-        lab.configure()
-        lab.route_tests()
-        lab.stale_test()
-        lab.configure(mode="incoming", local_as=64512, remote_as=64512)
-        attrs = lab.control("show route table master4 10.1.0.0/24 all")
-        assert re.search(r"BGP.local_pref:\s+100", attrs), attrs
-        print("PASS incoming iBGP and LOCAL_PREF", flush=True)
-        lab.configure(mode="both", local_as=4200000001, remote_as=4200000002, v6_transport=True, maximum=2000000)
-        attrs = lab.control("show route table master4 10.1.0.0/24 all")
-        assert "4200000001" in attrs, attrs
-        print("PASS IPv6 transport, simultaneous connect and four-byte ASN", flush=True)
-        if os.environ.get("UBGP_SCALE") == "1":
-            lab.scale_interfaces()
-            lab.loss_test(100000)
-        else:
-            lab.loss_test()
-        print("All Docker integration tests passed", flush=True)
-    except BaseException:
-        for log in Path(directory).glob("*.log"):
-            print(f"\n--- {log.name} (last 100 lines) ---\n" + "\n".join(log.read_text().splitlines()[-100:]), flush=True)
-        raise
-    finally:
-        if lab:
-            lab.close()
+def main():
+    with tempfile.TemporaryDirectory(prefix="ubgp-tests-") as directory:
+        lab = None
+        try:
+            lab = Lab(directory)
+            lab.configure()
+            lab.route_tests()
+            lab.stale_test()
+            lab.configure(mode="incoming", local_as=64512, remote_as=64512)
+            attrs = lab.control("show route table master4 10.1.0.0/24 all")
+            assert re.search(r"BGP.local_pref:\s+100", attrs), attrs
+            print("PASS incoming iBGP and LOCAL_PREF", flush=True)
+            lab.configure(mode="both", local_as=4200000001, remote_as=4200000002, v6_transport=True, maximum=2000000)
+            attrs = lab.control("show route table master4 10.1.0.0/24 all")
+            assert "4200000001" in attrs, attrs
+            print("PASS IPv6 transport, simultaneous connect and four-byte ASN", flush=True)
+            if os.environ.get("UBGP_SCALE") == "1":
+                lab.scale_interfaces()
+                lab.loss_test(100000)
+            else:
+                lab.loss_test()
+            print("All Docker integration tests passed", flush=True)
+        except BaseException:
+            for log in Path(directory).glob("*.log"):
+                print(f"\n--- {log.name} (last 100 lines) ---\n" + "\n".join(log.read_text().splitlines()[-100:]), flush=True)
+            raise
+        finally:
+            if lab:
+                lab.close()
+
+
+if __name__ == "__main__":
+    main()

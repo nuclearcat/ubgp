@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub type Prefixes = HashSet<IpNet>;
 pub type Exports = HashMap<String, Arc<Prefixes>>;
@@ -591,7 +591,7 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
                         .lock()
                         .unwrap()
                         .publish(Instant::now(), changed, &tx, exports);
-                    info!(
+                    debug!(
                         dumps,
                         prefixes = prefixes.len(),
                         elapsed_ms = started.elapsed().as_millis(),

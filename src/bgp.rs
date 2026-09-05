@@ -1,5 +1,6 @@
 use crate::{
     config::{Config, Peer},
+    management::{self, Status},
     netlink::{Exports, Prefixes},
     wire::{self, Negotiated, ProtocolError},
 };
@@ -125,6 +126,7 @@ fn check_local_addresses(p: &Peer) -> Result<Option<std::net::Ipv6Addr>> {
 }
 
 async fn connect(p: &Peer) -> Result<TcpStream> {
+    info!(peer = %p.address, local = %p.local_address, interface = %p.interface, port = p.port, md5 = p.md5_password.is_some(), "BGP Connect: starting outgoing TCP connection");
     let idx = index(p)?;
     let socket = if p.address.is_ipv4() {
         TcpSocket::new_v4()?
@@ -132,13 +134,17 @@ async fn connect(p: &Peer) -> Result<TcpStream> {
         TcpSocket::new_v6()?
     };
     configure(&SockRef::from(&socket), p)?;
-    socket.bind(endpoint(p.local_address, 0, idx))?;
-    Ok(timeout(
+    socket
+        .bind(endpoint(p.local_address, 0, idx))
+        .context("binding local TCP address")?;
+    crate::tcp_md5::install(&socket, p, idx)?;
+    timeout(
         Duration::from_secs(p.connect_timeout_secs),
         socket.connect(endpoint(p.address, p.port, idx)),
     )
     .await
-    .context("TCP connect timeout")??)
+    .with_context(|| format!("TCP connect timed out after {}s", p.connect_timeout_secs))?
+    .context("TCP connect failed")
 }
 async fn send(writer: &mut (impl AsyncWrite + Unpin), packet: &[u8], seconds: u64) -> Result<()> {
     timeout(Duration::from_secs(seconds), writer.write_all(packet))
@@ -163,13 +169,15 @@ async fn handshake(
     p: Peer,
     incoming: bool,
 ) -> Result<Candidate> {
+    info!(peer = %p.address, incoming, "BGP TCP connected");
     configure(&SockRef::from(&stream), &p)?;
     let link_local = check_local_addresses(&p)?;
     let result = async {
         send(&mut stream, &wire::open(&cfg, &p), p.write_timeout_secs).await?;
+        info!(peer = %p.address, incoming, "BGP OpenSent: waiting for peer OPEN");
         let (kind, body) = wire::read_frame(&mut stream).await?;
         if kind != 1 {
-            return Err(wire::unexpected(kind));
+            return Err(wire::unexpected(kind, &body));
         }
         wire::parse_open(&body, &cfg, &p)
     };
@@ -196,7 +204,13 @@ async fn choose(
     let mut tasks = JoinSet::new();
     let c = cfg.clone();
     let peer = p.clone();
-    tasks.spawn(async move { handshake(connect(&peer).await?, c, peer, false).await });
+    tasks.spawn(async move {
+        let stream = connect(&peer).await.context("outgoing TCP setup")?;
+        handshake(stream, c, peer, false)
+            .await
+            .context("outgoing BGP OPEN exchange")
+    });
+    let mut errors = Vec::with_capacity(2);
     let mut pending: Option<Candidate> = None;
     let mut deadline = Instant::now() + Duration::from_secs(p.connect_timeout_secs + 2);
     let mut incoming_started = false;
@@ -205,7 +219,11 @@ async fn choose(
             stream = incoming.recv(), if !incoming_started => {
                 let Some(stream) = stream else { bail!("incoming listener stopped"); };
                 incoming_started = true;
-                tasks.spawn(handshake(stream,cfg.clone(),p.clone(),true));
+                let c = cfg.clone();
+                let peer = p.clone();
+                tasks.spawn(async move {
+                    handshake(stream, c, peer, true).await.context("incoming BGP OPEN exchange")
+                });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
                 match result.context("missing connection task")?? {
@@ -221,13 +239,20 @@ async fn choose(
                         pending = Some(candidate);
                         deadline = Instant::now() + Duration::from_millis(500);
                     }
-                    Err(e) => debug!(peer = %p.address, %e, "connection candidate failed"),
+                    Err(e) => {
+                        debug!(peer = %p.address, e = %format!("{e:#}"), "connection candidate failed");
+                        errors.push(format!("{e:#}"));
+                    }
                 }
-                if tasks.is_empty() && pending.is_none() && incoming_started { bail!("both connection candidates failed"); }
+                if tasks.is_empty() && pending.is_none() && incoming_started {
+                    bail!("both connection candidates failed: {}", errors.join("; "));
+                }
             }
             _ = sleep_until(deadline) => {
                 if let Some(candidate) = pending.take() { return Ok(candidate); }
-                bail!("no usable BGP connection");
+                let incoming_status = if incoming_started { "incoming candidate did not establish" } else { "no incoming TCP connection received" };
+                if errors.is_empty() { errors.push("connection attempt still pending at selection deadline".into()); }
+                bail!("no usable BGP connection: {}; {incoming_status}", errors.join("; "));
             }
         }
     }
@@ -268,7 +293,7 @@ async fn receive(
                     refresh.notify_one();
                 }
             }
-            other => return Err(wire::unexpected(other)),
+            other => return Err(wire::unexpected(other, &packet.1)),
         }
         // An inbound route flood cannot monopolize a runtime worker.
         tokio::task::yield_now().await;
@@ -385,7 +410,7 @@ async fn transmit(
                 send(writer, &wire::end_of_rib(true), p.write_timeout_secs).await?;
             }
             eor = false;
-            info!(peer = %p.address, prefixes = advertised.len(), "BGP export synchronized");
+            debug!(peer = %p.address, prefixes = advertised.len(), "BGP export synchronized");
         }
         tokio::select! {
             result = exports.changed() => {
@@ -407,6 +432,7 @@ async fn transmit(
 }
 
 async fn session(
+    status: Status,
     mut candidate: Candidate,
     cfg: Arc<Config>,
     mut p: Peer,
@@ -415,6 +441,7 @@ async fn session(
     if p.ipv6 && p.next_hop_v6_link_local.is_none() {
         p.next_hop_v6_link_local = candidate.link_local;
     }
+    management::update(&status, "OpenConfirm", None);
     let n = candidate.negotiated;
     send(
         &mut candidate.stream,
@@ -427,12 +454,13 @@ async fn session(
     } else {
         n.hold as u64
     };
+    info!(peer = %p.address, incoming = candidate.incoming, "BGP OpenConfirm: waiting for KEEPALIVE");
     let confirm = timeout(
         Duration::from_secs(confirm_secs),
         wire::read_frame(&mut candidate.stream),
     )
     .await;
-    let (kind, _) = match confirm {
+    let (kind, body) = match confirm {
         Ok(Ok(packet)) => packet,
         result => {
             let e = match result {
@@ -450,10 +478,11 @@ async fn session(
         }
     };
     if kind != wire::KEEPALIVE {
-        let e = wire::unexpected(kind);
+        let e = wire::unexpected(kind, &body);
         report(&mut candidate.stream, &e).await;
         return Err(e);
     }
+    management::update(&status, "Established", None);
     info!(peer = %p.address, remote_id = %n.router_id, incoming = candidate.incoming, hold = n.hold, ipv4 = n.ipv4, ipv6 = n.ipv6, "BGP Established");
     let (mut reader, mut writer) = candidate.stream.into_split();
     let refresh = Notify::new();
@@ -467,10 +496,16 @@ async fn session(
     if let Err(ref e) = result {
         report(&mut writer, e).await;
     }
+    management::update(
+        &status,
+        "Active",
+        result.as_ref().err().map(|e| format!("{e:#}")),
+    );
     result
 }
 
 async fn peer_loop(
+    status: Status,
     cfg: Arc<Config>,
     p: Peer,
     mut incoming: mpsc::Receiver<TcpStream>,
@@ -478,15 +513,22 @@ async fn peer_loop(
 ) -> Result<()> {
     let mut failures = 0u32;
     loop {
+        management::update(&status, "Connect", None);
         match choose(cfg.clone(), p.clone(), &mut incoming).await {
             Ok(candidate) => {
                 let started = Instant::now();
-                let session = session(candidate, cfg.clone(), p.clone(), exports.clone());
+                let session = session(
+                    status.clone(),
+                    candidate,
+                    cfg.clone(),
+                    p.clone(),
+                    exports.clone(),
+                );
                 tokio::pin!(session);
                 loop {
                     tokio::select! {
                         result = &mut session => {
-                            if let Err(e) = result { warn!(peer = %p.address, %e, "BGP session closed"); }
+                            if let Err(e) = result { management::update(&status, "Active", Some(format!("{e:#}"))); warn!(peer = %p.address, e = %format!("{e:#}"), "BGP session closed"); }
                             break;
                         }
                         stream = incoming.recv() => {
@@ -501,14 +543,19 @@ async fn peer_loop(
                     failures = 0;
                 }
             }
-            Err(e) => warn!(peer = %p.address, %e, "BGP connection failed"),
+            Err(e) => {
+                management::update(&status, "Active", Some(format!("{e:#}")));
+                warn!(peer = %p.address, local = %p.local_address, interface = %p.interface, port = p.port, md5 = p.md5_password.is_some(), e = %format!("{e:#}"), "BGP connection failed")
+            }
         }
+        management::update(&status, "Active", None);
         failures = failures.saturating_add(1);
         let base = (1u64 << failures.min(5)).min(30);
         let jitter = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_millis() as u64;
+        info!(peer = %p.address, retry_ms = base * 1000 + jitter, "BGP Active: waiting before outgoing retry; accepting incoming connections");
         // Still accept incoming sessions during outbound backoff.
         tokio::select! {
             _ = sleep(Duration::from_millis(base * 1000 + jitter)) => {}
@@ -516,26 +563,39 @@ async fn peer_loop(
                 let Some(stream) = stream else { bail!("listener stopped"); };
                 match handshake(stream,cfg.clone(),p.clone(),true).await {
                     Ok(candidate) => {
-                        if let Err(e) = session(candidate,cfg.clone(),p.clone(),exports.clone()).await { warn!(peer = %p.address, %e, "incoming BGP session closed"); }
+                        if let Err(e) = session(status.clone(),candidate,cfg.clone(),p.clone(),exports.clone()).await { management::update(&status, "Active", Some(format!("{e:#}"))); warn!(peer = %p.address, e = %format!("{e:#}"), "incoming BGP session closed"); }
                     }
-                    Err(e) => debug!(peer = %p.address, %e, "incoming handshake failed"),
+                    Err(e) => {
+                        management::update(&status, "Active", Some(format!("{e:#}")));
+                        warn!(peer = %p.address, e = %format!("{e:#}"), "incoming handshake failed");
+                    },
                 }
             }
         }
     }
 }
 
-pub async fn run(cfg: Arc<Config>, exports: watch::Receiver<Arc<Exports>>) -> Result<()> {
+pub async fn run(
+    cfg: Arc<Config>,
+    exports: watch::Receiver<Arc<Exports>>,
+    statuses: Vec<Status>,
+) -> Result<()> {
     let mut tasks = JoinSet::new();
     type ListenerPeers = HashMap<IpAddr, mpsc::Sender<TcpStream>>;
     let mut listeners: HashMap<(IpAddr, String), ListenerPeers> = HashMap::new();
-    for p in &cfg.peers {
+    for (p, status) in cfg.peers.iter().zip(statuses) {
         let (tx, rx) = mpsc::channel(2);
         listeners
             .entry((p.local_address, p.interface.clone()))
             .or_default()
             .insert(p.address, tx);
-        tasks.spawn(peer_loop(cfg.clone(), p.clone(), rx, exports.clone()));
+        tasks.spawn(peer_loop(
+            status,
+            cfg.clone(),
+            p.clone(),
+            rx,
+            exports.clone(),
+        ));
     }
     for ((local, interface), peers) in listeners {
         let p = cfg
@@ -558,6 +618,15 @@ pub async fn run(cfg: Arc<Config>, exports: watch::Receiver<Arc<Exports>>) -> Re
             socket.set_only_v6(true)?;
         }
         configure(&SockRef::from(&socket), p)?;
+        // Multiple neighbors share this listener. Install every configured key
+        // before accepting SYNs; applying only the first peer's key is unsafe.
+        for peer in cfg
+            .peers
+            .iter()
+            .filter(|peer| peer.local_address == local && peer.interface == interface)
+        {
+            crate::tcp_md5::install(&socket, peer, idx)?;
+        }
         socket.set_nonblocking(true)?;
         socket
             .bind(&endpoint(local, cfg.listen_port, idx).into())
@@ -583,6 +652,28 @@ pub async fn run(cfg: Arc<Config>, exports: watch::Receiver<Arc<Exports>>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn selection_preserves_outgoing_failure_when_no_peer_connects() {
+        let cfg: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let mut peer = cfg.peers[0].clone();
+        peer.interface = "ubgp-missing".into();
+        peer.connect_timeout_secs = 0;
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let error = choose(Arc::new(cfg), peer, &mut receiver)
+            .await
+            .err()
+            .unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("outgoing TCP setup"), "{message}");
+        assert!(
+            message.contains("interface ubgp-missing does not exist"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no incoming TCP connection received"),
+            "{message}"
+        );
+    }
     fn n() -> Negotiated {
         Negotiated {
             router_id: "192.0.2.2".parse().unwrap(),

@@ -3,7 +3,7 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
 };
 
@@ -18,8 +18,25 @@ pub struct Config {
     pub listen_port: u16,
     #[serde(default)]
     pub kernel: Kernel,
+    #[serde(default)]
+    pub management: Management,
     pub acls: HashMap<String, Acl>,
     pub peers: Vec<Peer>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Management {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+}
+impl Default for Management {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "127.0.0.1:65090".parse().unwrap(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55,6 +72,7 @@ pub struct Peer {
     pub interface: String,
     pub remote_asn: u32,
     pub export_acl: String,
+    pub md5_password: Option<Md5Key>,
     #[serde(default = "port")]
     pub port: u16,
     #[serde(default = "hold")]
@@ -70,6 +88,21 @@ pub struct Peer {
     pub next_hop_v4: Option<Ipv4Addr>,
     pub next_hop_v6: Option<Ipv6Addr>,
     pub next_hop_v6_link_local: Option<Ipv6Addr>,
+}
+
+/// A shared TCP-MD5 key. Debug output must never expose its contents.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Md5Key(String);
+impl std::fmt::Debug for Md5Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+impl Md5Key {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 fn port() -> u16 {
     179
@@ -143,11 +176,30 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Self = toml::from_str(&text).context("parsing configuration")?;
+        let cfg = Self::parse(&text)?;
         cfg.validate()?;
         Ok(cfg)
     }
+    fn parse(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|error: toml::de::Error| {
+            // TOML's rendered errors include source lines, and even its message
+            // may quote values. Preserve location without leaking shared keys.
+            let start = error.span().map_or(0, |span| span.start).min(text.len());
+            let before = &text.as_bytes()[..start];
+            let line = before.iter().filter(|b| **b == b'\n').count() + 1;
+            let column = before.iter().rposition(|b| *b == b'\n').map_or(start + 1, |n| start - n);
+            anyhow::anyhow!("parsing configuration at line {line}, column {column}: check TOML syntax, field names and types (source omitted to protect secrets)")
+        })
+    }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.management.listen.ip().is_loopback(),
+            "management CLI must bind to a loopback address"
+        );
+        ensure!(
+            self.management.listen.port() != 0,
+            "management CLI port must be nonzero"
+        );
         ensure!(
             self.asn != 0 && self.asn != 23456,
             "local ASN must be nonzero and not AS_TRANS"
@@ -200,6 +252,13 @@ impl Config {
         }
         let mut endpoints = HashSet::new();
         for p in &self.peers {
+            ensure!(
+                p.md5_password.as_ref().is_none_or(
+                    |key| (1..=libc::TCP_MD5SIG_MAXKEYLEN).contains(&key.as_bytes().len())
+                ),
+                "peer {}: md5_password must contain 1..=80 UTF-8 bytes; omit it to disable authentication",
+                p.address
+            );
             ensure!(
                 self.acls.contains_key(&p.export_acl),
                 "peer {}: mandatory export ACL {:?} does not exist",
@@ -281,6 +340,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn md5_keys_are_optional_bounded_by_bytes_and_redacted() {
+        let mut c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        c.validate().unwrap();
+        for value in ["x".into(), "x".repeat(80), "é".repeat(40)] {
+            c.peers[0].md5_password = Some(Md5Key(value));
+            c.validate().unwrap();
+        }
+        for value in [String::new(), "x".repeat(81), "é".repeat(41)] {
+            c.peers[0].md5_password = Some(Md5Key(value));
+            assert!(c.validate().is_err());
+        }
+        c.peers[0].md5_password = Some(Md5Key("test-secret-do-not-print".into()));
+        assert!(!format!("{c:?}").contains("test-secret-do-not-print"));
+        for text in [
+            "md5_password = \"test-secret-do-not-print\" trailing",
+            "asn = \"test-secret-do-not-print\"",
+        ] {
+            let error = Config::parse(text).unwrap_err();
+            assert!(!format!("{error:#}").contains("test-secret-do-not-print"));
+            assert!(error.to_string().contains("line"));
+        }
+    }
     #[test]
     fn acl_order_ranges_and_default_deny() {
         let acl: Acl = toml::from_str(

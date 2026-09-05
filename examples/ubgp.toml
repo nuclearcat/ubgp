@@ -4,6 +4,11 @@ router_id = "192.0.2.1"
 ipv6 = false
 listen_port = 179
 
+# Optional read-only Telnet console (these are the defaults).
+# [management]
+# enabled = true
+# listen = "127.0.0.1:65090"
+
 [kernel]
 tables = [254] # Linux main table; e.g. [100, 200] for selected policy tables
 receive_buffer_bytes = 67108864
@@ -27,6 +32,7 @@ local_address = "192.0.2.1"
 interface = "eth0"
 remote_asn = 64513 # Same as local ASN selects iBGP
 export_acl = "export" # REQUIRED on every peer, including iBGP
+# md5_password = "replace-with-shared-secret" # Optional TCP-MD5, 1..80 UTF-8 bytes
 port = 179
 hold_time_secs = 90 # 0 disables the hold/keepalive timers; otherwise >= 3
 connect_timeout_secs = 10
