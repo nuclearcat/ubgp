@@ -1,0 +1,22 @@
+[package]
+name = "ubgp"
+version = "0.1.0"
+edition = "2024"
+description = "Linux announce-only BGP daemon with mandatory export ACLs"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+ipnet = { version = "2.12", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

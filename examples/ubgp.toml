@@ -1,0 +1,46 @@
+# Install as /etc/ubgp.toml; all addresses below are documentation examples.
+asn = 64512
+router_id = "192.0.2.1"
+ipv6 = false
+listen_port = 179
+
+[kernel]
+tables = [254] # Linux main table; e.g. [100, 200] for selected policy tables
+receive_buffer_bytes = 67108864
+refresh_interval_ms = 250
+reconcile_interval_secs = 300
+stale_timeout_secs = 30
+dump_timeout_secs = 10
+max_prefixes = 2000000
+
+[acls.export]
+# First match wins, implicit deny. No length range means exact prefix only.
+rules = [
+    { action = "deny", prefix = "203.0.113.128/25", min_length = 25, max_length = 32 },
+    { action = "permit", prefix = "198.51.100.0/24" },
+    { action = "permit", prefix = "203.0.113.0/24", min_length = 26, max_length = 32 },
+]
+
+[[peers]]
+address = "192.0.2.2"
+local_address = "192.0.2.1"
+interface = "eth0"
+remote_asn = 64513 # Same as local ASN selects iBGP
+export_acl = "export" # REQUIRED on every peer, including iBGP
+port = 179
+hold_time_secs = 90 # 0 disables the hold/keepalive timers; otherwise >= 3
+connect_timeout_secs = 10
+write_timeout_secs = 10
+ipv4 = true
+ipv6 = false
+
+# For dual stack over this IPv4 session:
+# 1. Set global ipv6 = true and this peer's ipv6 = true.
+# 2. Add explicit IPv6 permit rules to the export ACL.
+# 3. Set next_hop_v6 to an IPv6 address assigned to the peering interface.
+# next_hop_v6 = "2001:db8:ffff::1"
+# next_hop_v6_link_local = "fe80::1" # Optional, must also be locally assigned.
+#
+# IPv6 transport is supported too, including link-local peers (scope comes
+# from interface). For IPv4 NLRI over an IPv6 transport, set next_hop_v4 to
+# the local interface's IPv4 address. RFC 8950 extended next hops are not used.
