@@ -1,4 +1,5 @@
 target
+dist
 .git
 .agents
 .codex

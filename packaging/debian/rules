@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	+cargo build --release --locked
+
+override_dh_auto_test:
+	+cargo test --locked
+	target/release/ubgp --config examples/ubgp.toml --check-config
+
+override_dh_auto_install:
+	install -Dm755 target/release/ubgp debian/ubgp/usr/sbin/ubgp
+	install -Dm644 examples/ubgp.toml debian/ubgp/etc/ubgp.toml
+	install -Dm644 examples/ubgp.toml debian/ubgp/usr/share/doc/ubgp/examples/ubgp.toml
+	install -Dm644 packaging/90-ubgp.conf debian/ubgp/usr/share/doc/ubgp/examples/90-ubgp.conf
+	install -Dm644 LICENSE debian/ubgp/usr/share/doc/ubgp/copyright
+
+# Operators must configure addresses, interfaces and export ACLs first.
+# Also avoid interrupting BGP sessions automatically during upgrades.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_compress:
+	dh_compress -X.toml -X.conf

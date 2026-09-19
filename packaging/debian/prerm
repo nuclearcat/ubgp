@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# --no-start suppresses debhelper's removal stop hook as well. Stop only on
+# removal; upgrading must leave existing BGP sessions running.
+if [ "$1" = remove ] && [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ]; then
+    deb-systemd-invoke stop ubgp.service >/dev/null || true
+fi
+#DEBHELPER#

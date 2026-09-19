@@ -1,0 +1,16 @@
+Source: ubgp
+Section: net
+Priority: optional
+Maintainer: ubgp contributors <nuclearcat@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/nuclearcat/ubgp
+Rules-Requires-Root: no
+
+Package: ubgp
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: announce-only BGP daemon with mandatory export ACLs
+ Exports permitted kernel prefixes from selected Linux routing tables to
+ directly connected eBGP and iBGP neighbors. Never installs received routes.
+ Includes IPv4 and IPv6, TCP-MD5 authentication, and a read-only console.

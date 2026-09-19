@@ -1,0 +1,83 @@
+name: Debian and Ubuntu packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-packages-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.distribution }} / amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian12, debian13, ubuntu22.04, ubuntu24.04, ubuntu26.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+          persist-credentials: false
+      - name: Build and test package
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+          UBGP_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: ./packaging/build-debs.sh "$DISTRIBUTION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ubgp-${{ matrix.distribution }}-amd64
+          path: dist/${{ matrix.distribution }}/*.deb
+          if-no-files-found: error
+          compression-level: 0
+
+  collect:
+    name: Collect packages and checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ubgp-*-amd64
+          merge-multiple: true
+          path: dist
+      - name: Check package count and generate checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          packages=(*.deb)
+          test "${#packages[@]}" -eq 5
+          sha256sum "${packages[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ubgp-debs-amd64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Attach packages to release
+    if: github.event_name == 'release'
+    needs: collect
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ubgp-debs-amd64
+          path: dist
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*.deb dist/SHA256SUMS --clobber
