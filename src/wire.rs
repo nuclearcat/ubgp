@@ -306,6 +306,24 @@ pub fn update(
         nlri(&mut encoded, prefix);
     }
     let mut attrs = Vec::new();
+    // RFC 7606 requires MP NLRI first so it can be located before other attributes.
+    if v6 {
+        let mut mp = vec![0, 2, 1];
+        if !withdraw {
+            mp.push(if p.next_hop_v6_link_local.is_some() {
+                32
+            } else {
+                16
+            });
+            mp.extend_from_slice(&p.nh6().expect("validated next hop").octets());
+            if let Some(link_local) = p.next_hop_v6_link_local {
+                mp.extend_from_slice(&link_local.octets());
+            }
+            mp.push(0);
+        }
+        mp.extend_from_slice(&encoded);
+        attr(&mut attrs, 0x80, if withdraw { 15 } else { 14 }, &mp);
+    }
     if !withdraw {
         attr(&mut attrs, 0x40, 1, &[2]); // ORIGIN INCOMPLETE: redistributed kernel routes.
         let mut path = Vec::new();
@@ -334,23 +352,6 @@ pub fn update(
                 &p.nh4().expect("validated next hop").octets(),
             );
         }
-    }
-    if v6 {
-        let mut mp = vec![0, 2, 1];
-        if !withdraw {
-            mp.push(if p.next_hop_v6_link_local.is_some() {
-                32
-            } else {
-                16
-            });
-            mp.extend_from_slice(&p.nh6().expect("validated next hop").octets());
-            if let Some(link_local) = p.next_hop_v6_link_local {
-                mp.extend_from_slice(&link_local.octets());
-            }
-            mp.push(0);
-        }
-        mp.extend_from_slice(&encoded);
-        attr(&mut attrs, 0x80, if withdraw { 15 } else { 14 }, &mp);
     }
     let mut body = Vec::new();
     if withdraw && !v6 {
@@ -961,5 +962,45 @@ mod tests {
             bad[position] = value;
             assert!(parse_open(&bad, &c, &p).is_err(), "{position}={value}");
         }
+    }
+    #[test]
+    fn multiprotocol_nlri_is_first_on_wire_but_legacy_order_is_accepted() {
+        let (mut c, mut p, mut n) = fixture();
+        p.next_hop_v6 = Some("2001:db8::1".parse().unwrap());
+        p.next_hop_v6_link_local = Some("fe80::1".parse().unwrap());
+        for internal in [false, true] {
+            if internal {
+                c.asn = p.remote_asn;
+                n.internal = true;
+            }
+            for withdraw in [false, true] {
+                let packet = update(
+                    &c,
+                    &p,
+                    &n,
+                    &["2001:db8:100::/48".parse().unwrap()],
+                    withdraw,
+                );
+                let body = &packet[19..];
+                assert_eq!(&body[..2], &[0, 0]);
+                let len = u16b(&body[2..]) as usize;
+                assert_eq!(body.len(), len + 4);
+                let attrs = &body[4..];
+                assert_eq!(attrs[0], 0x80);
+                assert_eq!(attrs[1], if withdraw { 15 } else { 14 });
+                assert_eq!(&attrs[3..6], &[0, 2, 1]);
+                if !withdraw {
+                    assert_eq!(attrs[6], 32); // Global plus link-local next hop.
+                    let first_len = 3 + attrs[2] as usize;
+                    assert_eq!(&attrs[first_len..first_len + 4], &[0x40, 1, 1, 2]);
+                    let mut legacy = body[..4].to_vec();
+                    legacy.extend_from_slice(&attrs[first_len..]);
+                    legacy.extend_from_slice(&attrs[..first_len]);
+                    assert_eq!(validate_update(&legacy, &n).unwrap(), UpdateAction::Valid);
+                }
+                assert_eq!(validate_update(body, &n).unwrap(), UpdateAction::Valid);
+            }
+        }
+        assert_eq!(&end_of_rib(true)[19..], &[0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1]);
     }
 }
