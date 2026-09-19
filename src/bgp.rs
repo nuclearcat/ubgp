@@ -291,7 +291,12 @@ async fn receive(
         match packet.0 {
             wire::KEEPALIVE => expires = Instant::now() + Duration::from_secs(n.hold as u64),
             wire::UPDATE => {
-                wire::validate_update(&packet.1, n)?;
+                let action = wire::validate_update(&packet.1, n)?;
+                if action != wire::UpdateAction::Valid {
+                    warn!(?action, prefixes = ?wire::update_prefixes(&packet.1),
+                        packet = ?wire::frame(wire::UPDATE, &packet.1),
+                        "recovered inbound UPDATE; no received routes are installed");
+                }
                 expires = Instant::now() + Duration::from_secs(n.hold as u64);
             }
             wire::ROUTE_REFRESH => {
@@ -694,6 +699,7 @@ mod tests {
             router_id: "192.0.2.2".parse().unwrap(),
             hold: 3,
             asn4: true,
+            internal: false,
             ipv4: true,
             ipv6: false,
         }
@@ -757,5 +763,19 @@ mod tests {
         let (_, body) = wire::read_frame(&mut reader).await.unwrap();
         assert_eq!(&body[..2], &[0, 4]);
         task.abort();
+    }
+    #[tokio::test]
+    async fn recoverable_update_does_not_stop_receive_loop() {
+        // Missing mandatory attributes: treat the advertised route as withdrawn.
+        let mut input = wire::frame(wire::UPDATE, &[0, 0, 0, 0, 24, 10, 1, 0]);
+        input.extend(wire::frame(wire::KEEPALIVE, &[]));
+        input.extend(wire::notification(6, 0, &[]));
+        let error = receive(&mut input.as_slice(), &n(), &Notify::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("peer sent NOTIFICATION code=6"),
+            "{error:#}"
+        );
     }
 }

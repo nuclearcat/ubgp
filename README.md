@@ -105,7 +105,9 @@ restrict that file to the service account/group. Keys are redacted from Debug
 output; TOML parse errors report location without quoting configuration values.
 
 Received UPDATEs are bounded and structurally validated, then discarded.
-Malformed protocol messages can reset the session. This is an exporter, not
+Recoverable UPDATE attribute errors preserve the session using treat-as-withdraw
+or attribute-discard handling; malformed framing or unrecoverable NLRI still
+resets the session. Recovery logs include the packet and affected prefixes. This is an exporter, not
 a complete routing daemon: there is no best-path selection, route reflection,
 ADD-PATH, TCP-AO, BFD, graceful restart, VPN/EVPN, or forwarding-plane writes.
 

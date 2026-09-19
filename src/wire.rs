@@ -116,6 +116,7 @@ pub struct Negotiated {
     pub router_id: Ipv4Addr,
     pub hold: u16,
     pub asn4: bool,
+    pub internal: bool,
     pub ipv4: bool,
     pub ipv6: bool,
 }
@@ -234,6 +235,7 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
         router_id,
         hold: hold.min(p.hold_time_secs),
         asn4: as4.is_some(),
+        internal: cfg.asn == p.remote_asn,
         ipv4: p.ipv4 && (v4 || !mp),
         ipv6: p.ipv6 && v6,
     };
@@ -375,9 +377,24 @@ fn validate_path(mut b: &[u8], width: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Check an UPDATE body's NLRI, attribute structure, and mandatory attributes.
-/// Use the negotiated ASN width without retaining or installing received routes.
-pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<()> {
+/// The strongest nonfatal handling required for a received UPDATE.
+/// ubgp has no inbound RIB, so both recovery actions preserve the session without
+/// installing routes. Fatal errors are returned separately as [`ProtocolError`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UpdateAction {
+    Valid,
+    AttributeDiscard,
+    TreatAsWithdraw,
+}
+
+/// Check an UPDATE and classify recoverable errors under RFC 7606 and RFC 6793.
+/// Continue checking after recoverable errors so a later fatal error still wins.
+///
+/// # Errors
+/// Returns a protocol error when framing or NLRI cannot be recovered safely,
+/// MP attributes are duplicated, or an unknown well-known attribute is received.
+pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<UpdateAction> {
+    use UpdateAction::*;
     require(b.len() >= 4, 3, 1, "short UPDATE")?;
     let w = u16b(b) as usize;
     require(w + 4 <= b.len(), 3, 1, "invalid withdrawn length")?;
@@ -389,109 +406,189 @@ pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<()> {
     let mut attrs = &b[4 + w..4 + w + a];
     let mut seen = [false; 256];
     let mut mp_reach = false;
+    let mut action = Valid;
     while !attrs.is_empty() {
-        require(attrs.len() >= 3, 3, 1, "short attribute")?;
+        // The enclosing length still locates legacy NLRI if an attribute header
+        // or length is broken. Without reachable NLRI, recovery is unsafe.
+        if attrs.len() < 3 {
+            action = TreatAsWithdraw;
+            break;
+        }
         let flags = attrs[0];
         let kind = attrs[1] as usize;
         let h = if flags & 0x10 != 0 { 4 } else { 3 };
-        require(attrs.len() >= h, 3, 1, "short extended attribute")?;
+        let mp = kind == 14 || kind == 15;
+        if attrs.len() < h {
+            require(!mp, 3, 9, "short multiprotocol attribute header")?;
+            action = TreatAsWithdraw;
+            break;
+        }
         let l = if h == 4 {
             u16b(&attrs[2..]) as usize
         } else {
             attrs[2] as usize
         };
-        require(h + l <= attrs.len(), 3, 5, "truncated attribute")?;
-        require(!seen[kind], 3, 1, "duplicate attribute")?;
-        seen[kind] = true;
+        if h + l > attrs.len() {
+            require(!mp, 3, 9, "truncated multiprotocol attribute")?;
+            action = TreatAsWithdraw;
+            break;
+        }
         let data = &attrs[h..h + l];
+        if seen[kind] {
+            require(!mp, 3, 1, "duplicate multiprotocol attribute")?;
+            action = action.max(AttributeDiscard);
+            attrs = &attrs[h + l..];
+            continue;
+        }
+        seen[kind] = true;
+        // These attributes must be discarded regardless of their value or flags.
+        if (n.asn4 && matches!(kind, 17 | 18)) || (!n.internal && matches!(kind, 5 | 9 | 10)) {
+            action = action.max(AttributeDiscard);
+            attrs = &attrs[h + l..];
+            continue;
+        }
         let expected = match kind {
             1 | 2 | 3 | 5 | 6 => Some(0x40),
             4 | 9 | 10 | 14 | 15 => Some(0x80),
             7 | 8 | 16 | 17 | 18 | 32 => Some(0xc0),
             _ => None,
         };
-        if let Some(expected) = expected {
-            require(
-                flags & 0xc0 == expected && (flags & 0x20 == 0 || expected == 0xc0),
-                3,
-                4,
-                "invalid attribute flags",
-            )?;
-        }
-        match kind {
-            1 => require(l == 1 && data[0] <= 2, 3, 6, "invalid ORIGIN")?,
-            2 => validate_path(data, if n.asn4 { 4 } else { 2 })?,
-            3 => require(
-                l == 4 && valid_v4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
-                3,
-                8,
-                "invalid NEXT_HOP",
-            )?,
-            4 | 5 | 9 => require(l == 4, 3, 5, "invalid four-byte attribute")?,
-            6 => require(l == 0, 3, 5, "invalid ATOMIC_AGGREGATE")?,
-            7 => require(l == if n.asn4 { 8 } else { 6 }, 3, 5, "invalid AGGREGATOR")?,
-            8 | 10 => require(l % 4 == 0, 3, 5, "invalid community/cluster list")?,
-            16 => require(l % 8 == 0, 3, 5, "invalid extended communities")?,
-            17 => validate_path(data, 4)?,
-            18 => require(l == 8, 3, 5, "invalid AS4_AGGREGATOR")?,
-            32 => require(l % 12 == 0, 3, 5, "invalid large communities")?,
-            14 | 15 => {
-                require(l >= 3, 3, 9, "short multiprotocol attribute")?;
-                let afi = u16b(data);
-                let mut start = 3;
-                if kind == 14 {
+        let flags_ok = expected.is_none_or(|expected| {
+            flags & 0xc0 == expected && (flags & 0x20 == 0 || expected == 0xc0)
+        });
+        if mp {
+            require(flags_ok, 3, 9, "invalid multiprotocol attribute flags")?;
+            require(l >= 3, 3, 9, "short multiprotocol attribute")?;
+            let afi = u16b(data);
+            let mut start = 3;
+            if kind == 14 {
+                require(
+                    l >= 5 && data[3] as usize + 5 <= l,
+                    3,
+                    9,
+                    "invalid MP_REACH next hop",
+                )?;
+                if data[2] == 1 && (afi == 1 || afi == 2) {
                     require(
-                        l >= 5 && data[3] as usize + 5 <= l,
+                        if afi == 2 {
+                            data[3] == 16 || data[3] == 32
+                        } else {
+                            data[3] == 4
+                        },
                         3,
                         9,
-                        "invalid MP_REACH next hop",
+                        "invalid MP_REACH next-hop size",
                     )?;
-                    if data[2] == 1 && (afi == 1 || afi == 2) {
-                        require(
-                            if afi == 2 {
-                                data[3] == 16 || data[3] == 32
-                            } else {
-                                data[3] == 4
-                            },
-                            3,
-                            9,
-                            "invalid MP_REACH next-hop size",
-                        )?;
-                    }
-                    start = 5 + data[3] as usize;
-                    mp_reach |= start < l;
                 }
-                if data[2] == 1 && (afi == 1 || afi == 2) {
-                    validate_nlri(&data[start..], if afi == 1 { 32 } else { 128 })?;
-                }
+                start = 5 + data[3] as usize;
             }
-            _ => require(flags & 0x80 != 0, 3, 2, "unknown well-known attribute")?,
+            if data[2] == 1 && (afi == 1 || afi == 2) {
+                validate_nlri(&data[start..], if afi == 1 { 32 } else { 128 })?;
+                mp_reach |= kind == 14 && start < l;
+            }
+        } else {
+            let valid = match kind {
+                1 => l == 1 && data[0] <= 2,
+                2 => validate_path(data, if n.asn4 { 4 } else { 2 }).is_ok(),
+                3 => l == 4 && valid_v4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                4 | 5 | 9 => l == 4,
+                6 => l == 0,
+                7 => l == if n.asn4 { 8 } else { 6 },
+                8 | 10 => l != 0 && l % 4 == 0,
+                16 => l != 0 && l % 8 == 0,
+                17 => l >= 6 && l % 2 == 0 && validate_path(data, 4).is_ok(),
+                18 => l == 8,
+                32 => l != 0 && l % 12 == 0,
+                _ => {
+                    require(flags & 0x80 != 0, 3, 2, "unknown well-known attribute")?;
+                    true
+                }
+            };
+            if !flags_ok || !valid {
+                action = action.max(if matches!(kind, 6 | 7 | 17 | 18) {
+                    AttributeDiscard
+                } else {
+                    TreatAsWithdraw
+                });
+            }
         }
         attrs = &attrs[h + l..];
     }
-    if !tail.is_empty() || mp_reach {
-        for kind in [1, 2] {
-            if !seen[kind] {
-                return Err(ProtocolError {
-                    code: 3,
-                    subcode: 3,
-                    data: vec![kind as u8],
-                    reason: "missing mandatory attribute",
-                }
-                .into());
-            }
-        }
+    let reachable = !tail.is_empty() || mp_reach;
+    if reachable && (!seen[1] || !seen[2] || (n.internal && !seen[5])) {
+        action = TreatAsWithdraw;
     }
     if !tail.is_empty() && !seen[3] {
-        return Err(ProtocolError {
-            code: 3,
-            subcode: 3,
-            data: vec![3],
-            reason: "missing NEXT_HOP",
-        }
-        .into());
+        action = TreatAsWithdraw;
     }
-    Ok(())
+    require(
+        action != TreatAsWithdraw || reachable,
+        3,
+        1,
+        "cannot recover UPDATE without reachable NLRI",
+    )?;
+    Ok(action)
+}
+
+/// Decode supported reachable NLRI for recovery diagnostics after validation.
+/// Stop at malformed attribute boundaries; never interpret unknown address families.
+pub(crate) fn update_prefixes(b: &[u8]) -> Vec<IpNet> {
+    fn append(mut b: &[u8], v6: bool, out: &mut Vec<IpNet>) {
+        while !b.is_empty() {
+            let bits = b[0];
+            let size = (bits as usize).div_ceil(8);
+            if bits as usize > if v6 { 128 } else { 32 } || size + 1 > b.len() {
+                break;
+            }
+            let mut bytes = [0; 16];
+            bytes[..size].copy_from_slice(&b[1..1 + size]);
+            let ip = if v6 {
+                std::net::IpAddr::V6(bytes.into())
+            } else {
+                std::net::IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+            };
+            out.push(IpNet::new(ip, bits).unwrap().trunc());
+            b = &b[1 + size..];
+        }
+    }
+    let mut out = Vec::new();
+    if b.len() < 4 {
+        return out;
+    }
+    let w = u16b(b) as usize;
+    if w + 4 > b.len() {
+        return out;
+    }
+    let a = u16b(&b[2 + w..]) as usize;
+    if w + a + 4 > b.len() {
+        return out;
+    }
+    append(&b[4 + w + a..], false, &mut out);
+    let mut attrs = &b[4 + w..4 + w + a];
+    while attrs.len() >= 3 {
+        let h = if attrs[0] & 0x10 != 0 { 4 } else { 3 };
+        if attrs.len() < h {
+            break;
+        }
+        let l = if h == 4 {
+            u16b(&attrs[2..]) as usize
+        } else {
+            attrs[2] as usize
+        };
+        if h + l > attrs.len() {
+            break;
+        }
+        let data = &attrs[h..h + l];
+        if attrs[1] == 14 && l >= 5 && data[2] == 1 {
+            let start = 5 + data[3] as usize;
+            let afi = u16b(data);
+            if start <= l && (afi == 1 || afi == 2) {
+                append(&data[start..], afi == 2, &mut out);
+            }
+        }
+        attrs = &attrs[h + l..];
+    }
+    out
 }
 /// Decode a basic unicast refresh: `Some(true)` for IPv6, `Some(false)` for IPv4.
 /// Ignore unsupported subtypes and families; reject bodies that are not four bytes.
@@ -535,6 +632,7 @@ mod tests {
             router_id: "192.0.2.2".parse().unwrap(),
             hold: 90,
             asn4: true,
+            internal: false,
             ipv4: true,
             ipv6: true,
         };
@@ -624,6 +722,7 @@ mod tests {
             }
             let _ = parse_open(&bytes, &c, &p);
             let _ = validate_update(&bytes, &n);
+            let _ = update_prefixes(&bytes);
         }
     }
     #[test]
@@ -641,5 +740,126 @@ mod tests {
             let b = vec![255u8; l];
             let _ = validate_update(&b, &n);
         }
+    }
+    /// Build independent IPv4 UPDATE bytes with a known route and mandatory attributes.
+    fn received_update(asn4: bool, extra: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 1, 1, 2];
+        if asn4 {
+            attrs.extend_from_slice(&[0x40, 2, 6, 2, 1, 0, 0, 252, 1]);
+        } else {
+            attrs.extend_from_slice(&[0x40, 2, 4, 2, 1, 252, 1]);
+        }
+        attrs.extend_from_slice(&[0x40, 3, 4, 192, 0, 2, 2]);
+        attrs.extend_from_slice(extra);
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        body.extend(attrs);
+        body.extend_from_slice(&[24, 10, 1, 0]);
+        body
+    }
+
+    #[test]
+    fn update_recovery_and_fatal_boundaries() {
+        use UpdateAction::*;
+        let (_, _, n) = fixture();
+        let mut bad_origin = received_update(true, &[]);
+        bad_origin[7] = 3;
+        assert_eq!(validate_update(&bad_origin, &n).unwrap(), TreatAsWithdraw);
+        assert_eq!(
+            update_prefixes(&bad_origin),
+            vec!["10.1.0.0/24".parse::<IpNet>().unwrap()]
+        );
+        // The first occurrence wins, even if a later duplicate is malformed.
+        assert_eq!(
+            validate_update(&received_update(true, &[0x40, 1, 1, 3]), &n).unwrap(),
+            AttributeDiscard
+        );
+        for extra in [
+            vec![0xc0, 8, 0],
+            vec![0xc0, 16, 1, 0],
+            vec![0xc0, 32, 0],
+            vec![0x80, 4, 1, 0],
+            vec![0x40, 8, 4, 0, 0, 0, 1],
+            vec![0x80],
+            vec![0x80, 8, 255],
+        ] {
+            assert_eq!(
+                validate_update(&received_update(true, &extra), &n).unwrap(),
+                TreatAsWithdraw,
+                "{extra:?}"
+            );
+        }
+        for extra in [vec![0x40, 6, 1, 0], vec![0xc0, 7, 1, 0], vec![0x80, 6, 0]] {
+            assert_eq!(
+                validate_update(&received_update(true, &extra), &n).unwrap(),
+                AttributeDiscard
+            );
+        }
+        // Missing mandatory attributes are recoverable only with reachable NLRI.
+        assert_eq!(
+            validate_update(&[0, 0, 0, 0, 24, 10, 1, 0], &n).unwrap(),
+            TreatAsWithdraw
+        );
+        assert_eq!(validate_update(&[0, 0, 0, 0], &n).unwrap(), Valid);
+        let mut without_nlri = bad_origin.clone();
+        without_nlri.truncate(without_nlri.len() - 4);
+        assert!(validate_update(&without_nlri, &n).is_err());
+        let mut bad_nlri = bad_origin;
+        *bad_nlri.last_mut().unwrap() = 0;
+        let last = bad_nlri.len() - 4;
+        bad_nlri[last] = 33;
+        assert!(validate_update(&bad_nlri, &n).is_err());
+        for extra in [
+            vec![0x80, 14, 3, 0, 2, 1],
+            vec![0x80, 15, 4, 0, 2, 1, 129],
+            vec![0x80, 15, 3, 0, 2, 1, 0x80, 15, 3, 0, 2, 1],
+            vec![0x40, 99, 1, 0],
+        ] {
+            assert!(
+                validate_update(&received_update(true, &extra), &n).is_err(),
+                "{extra:?}"
+            );
+        }
+        // A later malformed MP attribute overrides an earlier recoverable error.
+        let mut both = received_update(true, &[0x80, 14, 3, 0, 2, 1]);
+        both[7] = 3;
+        assert!(validate_update(&both, &n).is_err());
+    }
+
+    #[test]
+    fn as4_attributes_and_external_only_discards_preserve_updates() {
+        let (_, _, mut n) = fixture();
+        for asn4 in [false, true] {
+            n.asn4 = asn4;
+            for extra in [vec![0xc0, 17, 1, 0], vec![0xc0, 18, 1, 0]] {
+                assert_eq!(
+                    validate_update(&received_update(asn4, &extra), &n).unwrap(),
+                    UpdateAction::AttributeDiscard
+                );
+            }
+        }
+        n.asn4 = true;
+        for kind in [5, 9, 10] {
+            let extra = [0x80, kind, 1, 0];
+            assert_eq!(
+                validate_update(&received_update(true, &extra), &n).unwrap(),
+                UpdateAction::AttributeDiscard
+            );
+            n.internal = true;
+            assert_eq!(
+                validate_update(&received_update(true, &extra), &n).unwrap(),
+                UpdateAction::TreatAsWithdraw
+            );
+            n.internal = false;
+        }
+        n.internal = true;
+        assert_eq!(
+            validate_update(&received_update(true, &[]), &n).unwrap(),
+            UpdateAction::TreatAsWithdraw
+        );
+        assert_eq!(
+            validate_update(&received_update(true, &[0x40, 5, 4, 0, 0, 0, 100]), &n).unwrap(),
+            UpdateAction::Valid
+        );
     }
 }
