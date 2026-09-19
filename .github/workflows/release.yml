@@ -54,6 +54,12 @@ jobs:
           shopt -s nullglob
           packages=(*.deb)
           test "${#packages[@]}" -eq 5
+          # GitHub release uploads replace '~' in asset names with '.'.
+          # Normalize before hashing so downloaded names match SHA256SUMS.
+          for package in "${packages[@]}"; do
+            mv -- "$package" "${package//\~/.}"
+          done
+          packages=(*.deb)
           sha256sum "${packages[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v7
