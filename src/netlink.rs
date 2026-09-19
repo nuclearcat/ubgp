@@ -626,7 +626,9 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
                     retries = 0;
                     let end = Instant::now();
                     dirty = changed;
-                    periodic = end + Duration::from_secs(cfg.kernel.reconcile_interval_secs);
+                    periodic = end
+                        .checked_add(Duration::from_secs(cfg.kernel.reconcile_interval_secs))
+                        .context("kernel reconciliation deadline exceeds clock range")?;
                     due = end + Duration::from_millis(cfg.kernel.refresh_interval_ms);
                 }
                 Err(error) => {

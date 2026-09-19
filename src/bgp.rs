@@ -213,6 +213,13 @@ async fn choose(
     p: Peer,
     incoming: &mut mpsc::Receiver<TcpStream>,
 ) -> Result<Candidate> {
+    let selection_secs = p
+        .connect_timeout_secs
+        .checked_add(2)
+        .context("connection selection deadline overflow")?;
+    let mut deadline = Instant::now()
+        .checked_add(Duration::from_secs(selection_secs))
+        .context("connection selection deadline exceeds clock range")?;
     let mut tasks = JoinSet::new();
     let c = cfg.clone();
     let peer = p.clone();
@@ -224,7 +231,6 @@ async fn choose(
     });
     let mut errors = Vec::with_capacity(2);
     let mut pending: Option<Candidate> = None;
-    let mut deadline = Instant::now() + Duration::from_secs(p.connect_timeout_secs + 2);
     let mut incoming_started = false;
     loop {
         tokio::select! {
@@ -958,5 +964,16 @@ mod tests {
         assert!(prefer_incoming(&c, &p, &negotiated));
         negotiated.router_id = "0.0.0.1".parse().unwrap();
         assert!(!prefer_incoming(&c, &p, &negotiated));
+    }
+    #[tokio::test]
+    async fn unchecked_timeout_returns_error_instead_of_panicking() {
+        let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        for seconds in [i64::MAX as u64, u64::MAX] {
+            let mut p = c.peers[0].clone();
+            p.connect_timeout_secs = seconds;
+            let (_tx, mut rx) = mpsc::channel(1);
+            let error = choose(Arc::new(c.clone()), p, &mut rx).await.err().unwrap();
+            assert!(error.to_string().contains("deadline"), "{error:#}");
+        }
     }
 }

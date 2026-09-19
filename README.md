@@ -252,6 +252,9 @@ configuration leaves the running daemon untouched. A valid reload closes
 sessions, starts a fresh kernel snapshot and reconnects with the new policy.
 Runtime failures such as an unavailable bind address cause startup failure;
 configuration validation does not reserve sockets or verify the live network.
+Peer connect/write timeouts and kernel dump/stale/reconciliation intervals must
+be between 1 and 86,400 seconds. The dump timeout must be shorter than the stale
+timeout. BGP hold time remains zero (disabled) or 3–65,535 seconds.
 SIGTERM/SIGINT closes sessions and stops workers.
 
 Default logs expose buffer sizing, notification loss, retries, stale withdrawals

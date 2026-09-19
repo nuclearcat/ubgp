@@ -7,6 +7,9 @@ use std::{
     path::Path,
 };
 
+/// Upper bound for configurable wall-clock timeouts, excluding the BGP hold timer.
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -233,12 +236,19 @@ impl Config {
             (10..=60000).contains(&self.kernel.refresh_interval_ms),
             "refresh_interval_ms must be 10..60000"
         );
-        ensure!(
-            self.kernel.reconcile_interval_secs > 0
-                && self.kernel.stale_timeout_secs > 0
-                && self.kernel.dump_timeout_secs > 0,
-            "kernel timeouts must be positive"
-        );
+        for (name, seconds) in [
+            (
+                "reconcile_interval_secs",
+                self.kernel.reconcile_interval_secs,
+            ),
+            ("stale_timeout_secs", self.kernel.stale_timeout_secs),
+            ("dump_timeout_secs", self.kernel.dump_timeout_secs),
+        ] {
+            ensure!(
+                (1..=MAX_TIMEOUT_SECS).contains(&seconds),
+                "kernel {name} must be 1..={MAX_TIMEOUT_SECS} seconds"
+            );
+        }
         ensure!(
             self.kernel.dump_timeout_secs < self.kernel.stale_timeout_secs,
             "dump timeout must be shorter than stale timeout"
@@ -315,10 +325,16 @@ impl Config {
                 p.hold_time_secs == 0 || p.hold_time_secs >= 3,
                 "hold time must be zero or >= 3 seconds"
             );
-            ensure!(
-                p.connect_timeout_secs > 0 && p.write_timeout_secs > 0,
-                "peer timeouts must be positive"
-            );
+            for (name, seconds) in [
+                ("connect_timeout_secs", p.connect_timeout_secs),
+                ("write_timeout_secs", p.write_timeout_secs),
+            ] {
+                ensure!(
+                    (1..=MAX_TIMEOUT_SECS).contains(&seconds),
+                    "peer {}: {name} must be 1..={MAX_TIMEOUT_SECS} seconds",
+                    p.address
+                );
+            }
             ensure!(
                 p.ipv4 || p.ipv6,
                 "peer must enable at least one address family"
@@ -423,5 +439,52 @@ mod tests {
         assert!(c.validate().is_err());
         assert!(!valid_v4("224.0.0.1".parse().unwrap()));
         assert!(!valid_v4("255.255.255.255".parse().unwrap()));
+    }
+    #[test]
+    fn timeout_bounds_reject_overflowing_toml_and_keep_valid_limits() {
+        let text = include_str!("../examples/ubgp.toml");
+        let oversized = text.replace(
+            "connect_timeout_secs = 10",
+            "connect_timeout_secs = 9223372036854775807",
+        );
+        let invalid = Config::parse(&oversized).unwrap();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("connect_timeout_secs")
+        );
+        let baseline = Config::parse(text).unwrap();
+        for value in [0, MAX_TIMEOUT_SECS + 1, i64::MAX as u64, u64::MAX] {
+            let mut c = baseline.clone();
+            c.peers[0].connect_timeout_secs = value;
+            assert!(c.validate().is_err());
+            let mut c = baseline.clone();
+            c.peers[0].write_timeout_secs = value;
+            assert!(c.validate().is_err());
+            let mut c = baseline.clone();
+            c.kernel.reconcile_interval_secs = value;
+            assert!(c.validate().is_err());
+            let mut c = baseline.clone();
+            c.kernel.stale_timeout_secs = value;
+            assert!(c.validate().is_err());
+            let mut c = baseline.clone();
+            c.kernel.dump_timeout_secs = value;
+            assert!(c.validate().is_err());
+        }
+        for value in [1, MAX_TIMEOUT_SECS] {
+            let mut c = baseline.clone();
+            c.peers[0].connect_timeout_secs = value;
+            c.peers[0].write_timeout_secs = value;
+            c.kernel.reconcile_interval_secs = value;
+            c.validate().unwrap();
+        }
+        let mut c = baseline;
+        c.kernel.stale_timeout_secs = MAX_TIMEOUT_SECS;
+        c.kernel.dump_timeout_secs = MAX_TIMEOUT_SECS - 1;
+        c.validate().unwrap();
+        c.kernel.dump_timeout_secs = MAX_TIMEOUT_SECS;
+        assert!(c.validate().is_err());
     }
 }
