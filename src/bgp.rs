@@ -12,7 +12,10 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::{CStr, CString},
     net::IpAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -263,12 +266,26 @@ async fn choose(
     // Dropping JoinSet aborts all unused candidates and closes their sockets.
 }
 
+/// Coalesce refresh requests by address family without losing requests during cooldown.
+#[derive(Default)]
+struct Refresh {
+    pending: AtomicU8,
+    ready: Notify,
+}
+impl Refresh {
+    fn request(&self, v6: bool) {
+        self.pending
+            .fetch_or(if v6 { 2 } else { 1 }, Ordering::Relaxed);
+        self.ready.notify_one();
+    }
+}
+
 /// Validate inbound messages and signal refreshes without importing routes.
 /// Only complete, valid UPDATEs and KEEPALIVEs reset the negotiated hold timer.
 async fn receive(
     reader: &mut (impl AsyncRead + Unpin),
     n: &Negotiated,
-    refresh: &Notify,
+    refresh: &Refresh,
 ) -> Result<()> {
     let mut expires = Instant::now() + Duration::from_secs(n.hold as u64);
     loop {
@@ -300,8 +317,8 @@ async fn receive(
                 expires = Instant::now() + Duration::from_secs(n.hold as u64);
             }
             wire::ROUTE_REFRESH => {
-                if wire::refresh_family(&packet.1, n)?.is_some() {
-                    refresh.notify_one();
+                if let Some(v6) = wire::refresh_family(&packet.1, n)? {
+                    refresh.request(v6);
                 }
             }
             other => return Err(wire::unexpected(other, &packet.1)),
@@ -317,7 +334,7 @@ struct Plan {
 }
 impl Plan {
     /// Diff against sent routes, gate additions by negotiated family, and replay on refresh.
-    fn new(advertised: &Prefixes, desired: &Prefixes, n: &Negotiated, refresh: bool) -> Self {
+    fn new(advertised: &Prefixes, desired: &Prefixes, n: &Negotiated, replay: &Prefixes) -> Self {
         let enabled = |p: &IpNet| if p.addr().is_ipv4() { n.ipv4 } else { n.ipv6 };
         let mut plan = Self {
             withdrawals: advertised
@@ -327,7 +344,7 @@ impl Plan {
                 .collect(),
             additions: desired
                 .iter()
-                .filter(|p| enabled(p) && (refresh || !advertised.contains(p)))
+                .filter(|p| enabled(p) && (replay.contains(p) || !advertised.contains(p)))
                 .copied()
                 .collect(),
         };
@@ -372,23 +389,38 @@ async fn transmit(
     p: &Peer,
     n: &Negotiated,
     mut exports: watch::Receiver<Arc<Exports>>,
-    refresh: &Notify,
+    refresh: &Refresh,
 ) -> Result<()> {
     let mut advertised = Prefixes::new();
     let mut target = desired(&mut exports, &p.export_acl);
-    let mut plan = Plan::new(&advertised, &target, n, false);
+    let mut replay = Prefixes::new();
+    let mut plan = Plan::new(&advertised, &target, n, &replay);
     let keepalive = Duration::from_secs((n.hold as u64 / 3).max(1));
     let mut next_keepalive = Instant::now() + keepalive;
-    let mut eor = true;
+    let mut eor = u8::from(n.ipv4) | (u8::from(n.ipv6) << 1);
     let mut last_replan = Instant::now();
-    let mut last_refresh = Instant::now() - Duration::from_secs(1);
+    let mut next_refresh = Instant::now();
     loop {
         // Replan against what was actually written, never against an obsolete
         // queued snapshot. Coalesce rapid snapshots without starving transmission.
         if exports.has_changed()? && last_replan.elapsed() >= Duration::from_millis(100) {
             target = desired(&mut exports, &p.export_acl);
-            plan = Plan::new(&advertised, &target, n, false);
+            replay.retain(|prefix| target.contains(prefix));
+            plan = Plan::new(&advertised, &target, n, &replay);
             last_replan = Instant::now();
+        }
+        if eor == 0 && Instant::now() >= next_refresh {
+            let families = refresh.pending.swap(0, Ordering::Relaxed);
+            if families != 0 {
+                replay = target
+                    .iter()
+                    .filter(|prefix| families & if prefix.addr().is_ipv6() { 2 } else { 1 } != 0)
+                    .copied()
+                    .collect();
+                plan = Plan::new(&advertised, &target, n, &replay);
+                eor = families & (u8::from(n.ipv4) | (u8::from(n.ipv6) << 1));
+                next_refresh = Instant::now() + Duration::from_secs(1);
+            }
         }
         if n.hold != 0 && Instant::now() >= next_keepalive {
             send(
@@ -407,6 +439,7 @@ async fn transmit(
             )
             .await?;
             for prefix in batch {
+                replay.remove(&prefix);
                 if withdraw {
                     advertised.remove(&prefix);
                 } else {
@@ -416,30 +449,26 @@ async fn transmit(
             tokio::task::yield_now().await;
             continue;
         }
-        if eor {
-            if n.ipv4 {
+        if eor != 0 {
+            if eor & 1 != 0 {
                 send(writer, &wire::end_of_rib(false), p.write_timeout_secs).await?;
             }
-            if n.ipv6 {
+            if eor & 2 != 0 {
                 send(writer, &wire::end_of_rib(true), p.write_timeout_secs).await?;
             }
-            eor = false;
+            eor = 0;
             debug!(peer = %p.address, prefixes = advertised.len(), "BGP export synchronized");
         }
         tokio::select! {
             result = exports.changed() => {
                 result?;
                 target = desired(&mut exports,&p.export_acl);
-                plan = Plan::new(&advertised,&target,n,false);
+                replay.retain(|prefix| target.contains(prefix));
+                plan = Plan::new(&advertised,&target,n,&replay);
                 last_replan = Instant::now();
             }
-            _ = refresh.notified() => {
-                // One outstanding refresh request, limited to one replay/second.
-                if last_refresh.elapsed() >= Duration::from_secs(1) {
-                    plan = Plan::new(&advertised,&target,n,true);
-                    last_refresh = Instant::now(); eor = true;
-                }
-            }
+            _ = refresh.ready.notified() => {}
+            _ = sleep_until(next_refresh), if eor == 0 && refresh.pending.load(Ordering::Relaxed) != 0 => {}
             _ = sleep_until(next_keepalive), if n.hold != 0 => {}
         }
     }
@@ -501,7 +530,7 @@ async fn session(
     management::update(&status, "Established", None);
     info!(peer = %p.address, remote_id = %n.router_id, incoming = candidate.incoming, hold = n.hold, ipv4 = n.ipv4, ipv6 = n.ipv6, "BGP Established");
     let (mut reader, mut writer) = candidate.stream.into_split();
-    let refresh = Notify::new();
+    let refresh = Refresh::default();
     // Reader and writer advance independently: a blocked write never stops the
     // receive hold timer. Cancellation closes the session, so partial frames
     // are never resumed on a different stream.
@@ -714,7 +743,7 @@ mod tests {
             .map(|s| s.parse().unwrap())
             .into_iter()
             .collect();
-        let mut plan = Plan::new(&advertised, &desired, &n(), false);
+        let mut plan = Plan::new(&advertised, &desired, &n(), &Prefixes::new());
         assert_eq!(
             plan.next(),
             Some((true, vec!["10.0.0.0/24".parse().unwrap()]))
@@ -724,7 +753,7 @@ mod tests {
             Some((false, vec!["10.2.0.0/24".parse().unwrap()]))
         );
         assert_eq!(plan.next(), None);
-        let refresh = Plan::new(&advertised, &desired, &n(), true);
+        let refresh = Plan::new(&advertised, &desired, &n(), &desired);
         assert_eq!(refresh.withdrawals.len(), 1);
         assert_eq!(refresh.additions.len(), 2);
     }
@@ -737,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn hold_timer_expires_with_partial_frame() {
         let (_writer, mut reader) = tokio::io::duplex(64);
-        let e = receive(&mut reader, &n(), &Notify::new())
+        let e = receive(&mut reader, &n(), &Refresh::default())
             .await
             .unwrap_err();
         assert_eq!(e.downcast_ref::<ProtocolError>().unwrap().code, 4);
@@ -750,10 +779,9 @@ mod tests {
         let initial: Prefixes = ["198.51.100.0/24".parse().unwrap()].into_iter().collect();
         let (tx, rx) = watch::channel(Arc::new(HashMap::from([(acl, Arc::new(initial))])));
         let (mut writer, mut reader) = tokio::io::duplex(8192);
-        let task =
-            tokio::spawn(
-                async move { transmit(&mut writer, &c, &p, &n(), rx, &Notify::new()).await },
-            );
+        let task = tokio::spawn(async move {
+            transmit(&mut writer, &c, &p, &n(), rx, &Refresh::default()).await
+        });
         let (kind, body) = wire::read_frame(&mut reader).await.unwrap();
         assert_eq!(kind, 2);
         assert_eq!(&body[..2], &[0, 0]);
@@ -770,12 +798,144 @@ mod tests {
         let mut input = wire::frame(wire::UPDATE, &[0, 0, 0, 0, 24, 10, 1, 0]);
         input.extend(wire::frame(wire::KEEPALIVE, &[]));
         input.extend(wire::notification(6, 0, &[]));
-        let error = receive(&mut input.as_slice(), &n(), &Notify::new())
+        let error = receive(&mut input.as_slice(), &n(), &Refresh::default())
             .await
             .unwrap_err();
         assert!(
             error.to_string().contains("peer sent NOTIFICATION code=6"),
             "{error:#}"
         );
+    }
+    /// Read a complete family export and return the reachable prefixes it carried.
+    async fn exported(reader: &mut (impl AsyncRead + Unpin), v6: bool) -> Prefixes {
+        let mut prefixes = Prefixes::new();
+        loop {
+            let (kind, body) = timeout(Duration::from_secs(5), wire::read_frame(reader))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(kind, wire::UPDATE);
+            if body == wire::end_of_rib(v6)[19..] {
+                return prefixes;
+            }
+            prefixes.extend(wire::update_prefixes(&body));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_during_cooldown_is_delayed_and_replayed() {
+        let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let p = c.peers[0].clone();
+        let prefixes: Prefixes = ["10.1.0.0/24".parse().unwrap()].into_iter().collect();
+        let (_tx, rx) = watch::channel(Arc::new(Exports::from([(
+            p.export_acl.clone(),
+            Arc::new(prefixes.clone()),
+        )])));
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        let refresh = Arc::new(Refresh::default());
+        let sender = refresh.clone();
+        let task = tokio::spawn(async move {
+            let mut negotiated = n();
+            negotiated.hold = 0;
+            transmit(&mut writer, &c, &p, &negotiated, rx, &sender).await
+        });
+        assert_eq!(exported(&mut reader, false).await, prefixes);
+        refresh.request(false);
+        assert_eq!(exported(&mut reader, false).await, prefixes);
+        let first = Instant::now();
+        refresh.request(false);
+        refresh.request(false); // Repeated requests coalesce into one pending replay.
+        assert_eq!(exported(&mut reader, false).await, prefixes);
+        assert!(first.elapsed() >= Duration::from_secs(1));
+        assert!(
+            timeout(Duration::from_secs(2), wire::read_frame(&mut reader))
+                .await
+                .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_replays_only_requested_family() {
+        let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let mut p = c.peers[0].clone();
+        p.next_hop_v6 = Some("2001:db8::1".parse().unwrap());
+        let prefixes: Prefixes = ["10.1.0.0/24", "2001:db8::/32"]
+            .map(|s| s.parse().unwrap())
+            .into_iter()
+            .collect();
+        let (_tx, rx) = watch::channel(Arc::new(Exports::from([(
+            p.export_acl.clone(),
+            Arc::new(prefixes),
+        )])));
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        let refresh = Arc::new(Refresh::default());
+        let sender = refresh.clone();
+        let task = tokio::spawn(async move {
+            let mut negotiated = n();
+            negotiated.hold = 0;
+            negotiated.ipv6 = true;
+            transmit(&mut writer, &c, &p, &negotiated, rx, &sender).await
+        });
+        exported(&mut reader, true).await;
+        // Exercise the receive loop's family dispatch as well as transmission.
+        let mut negotiated = n();
+        negotiated.ipv6 = true;
+        let mut input = wire::frame(wire::ROUTE_REFRESH, &[0, 2, 0, 1]);
+        input.extend(wire::notification(6, 0, &[]));
+        assert!(
+            receive(&mut input.as_slice(), &negotiated, &refresh)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("peer sent NOTIFICATION")
+        );
+        assert_eq!(
+            exported(&mut reader, true).await,
+            ["2001:db8::/32".parse().unwrap()].into_iter().collect()
+        );
+        assert!(
+            timeout(Duration::from_secs(2), wire::read_frame(&mut reader))
+                .await
+                .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_change_preserves_unfinished_refresh() {
+        let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let p = c.peers[0].clone();
+        let acl = p.export_acl.clone();
+        let mut prefixes: Prefixes = (0..600u32)
+            .map(|i| IpNet::new(std::net::Ipv4Addr::from(0x0a000000 + i).into(), 32).unwrap())
+            .collect();
+        let (tx, rx) = watch::channel(Arc::new(Exports::from([(
+            acl.clone(),
+            Arc::new(prefixes.clone()),
+        )])));
+        // Backpressure keeps multiple replay batches outstanding when the snapshot changes.
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let refresh = Arc::new(Refresh::default());
+        let sender = refresh.clone();
+        let task = tokio::spawn(async move {
+            let mut negotiated = n();
+            negotiated.hold = 0;
+            transmit(&mut writer, &c, &p, &negotiated, rx, &sender).await
+        });
+        assert_eq!(exported(&mut reader, false).await, prefixes);
+        refresh.request(false);
+        let (_, first) = wire::read_frame(&mut reader).await.unwrap();
+        let mut replayed: Prefixes = wire::update_prefixes(&first).into_iter().collect();
+        assert_eq!(replayed.len(), wire::MAX_UPDATE_PREFIXES);
+        prefixes.insert("10.99.0.1/32".parse().unwrap());
+        tx.send_replace(Arc::new(Exports::from([(acl, Arc::new(prefixes.clone()))])));
+        tokio::time::advance(Duration::from_millis(150)).await;
+        replayed.extend(exported(&mut reader, false).await);
+        assert_eq!(replayed, prefixes);
+        task.abort();
+        let _ = task.await;
     }
 }
