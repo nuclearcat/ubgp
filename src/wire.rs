@@ -164,26 +164,48 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
         3,
         "invalid or duplicate router ID",
     )?;
-    require(
-        b[9] as usize + 10 == b.len(),
-        2,
-        0,
-        "invalid OPEN parameter length",
-    )?;
-    let mut params = &b[10..];
+    // RFC 9072: the type-255 discriminator selects both extended length fields.
+    // The legacy length byte is ignored once that discriminator is present.
+    let extended = b[9] != 0 && b.get(10) == Some(&255);
+    let (mut params, parameter_header) = if extended {
+        require(b.len() >= 13, 2, 0, "short extended OPEN length")?;
+        require(
+            u16b(&b[11..13]) as usize + 13 == b.len(),
+            2,
+            0,
+            "invalid extended OPEN parameter length",
+        )?;
+        (&b[13..], 3)
+    } else {
+        require(
+            b[9] as usize + 10 == b.len(),
+            2,
+            0,
+            "invalid OPEN parameter length",
+        )?;
+        (&b[10..], 2)
+    };
     let mut as4 = None;
     let mut mp = false;
     let mut v4 = false;
     let mut v6 = false;
     while !params.is_empty() {
         require(
-            params.len() >= 2 && params[1] as usize + 2 <= params.len(),
+            params.len() >= parameter_header,
             2,
             0,
-            "invalid optional parameter",
+            "short optional parameter header",
         )?;
+        let length = if extended {
+            u16b(&params[1..3]) as usize
+        } else {
+            params[1] as usize
+        };
+        let end = parameter_header + length;
+        require(end <= params.len(), 2, 0, "invalid optional parameter")?;
         require(params[0] == 2, 2, 4, "unsupported optional parameter")?;
-        let mut caps = &params[2..2 + params[1] as usize];
+        // Capability lengths remain one octet even inside extended parameters.
+        let mut caps = &params[parameter_header..end];
         while !caps.is_empty() {
             require(
                 caps.len() >= 2 && caps[1] as usize + 2 <= caps.len(),
@@ -217,7 +239,7 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
             }
             caps = &caps[2 + caps[1] as usize..];
         }
-        params = &params[2 + params[1] as usize..];
+        params = &params[end..];
     }
     require(
         as4.unwrap_or(old_asn) == p.remote_asn,
@@ -883,6 +905,61 @@ mod tests {
                     assert_eq!((error.code, error.subcode), (2, 3));
                 }
             }
+        }
+    }
+    /// Build an extended OPEN around explicitly supplied parameter bytes.
+    fn extended_open(c: &Config, p: &Peer, params: &[u8]) -> Vec<u8> {
+        let mut b = vec![4];
+        b.extend_from_slice(&(p.remote_asn as u16).to_be_bytes());
+        b.extend_from_slice(&90u16.to_be_bytes());
+        b.extend_from_slice(&[192, 0, 2, 2]);
+        assert_ne!(c.router_id.octets(), [192, 0, 2, 2]);
+        b.extend_from_slice(&[255, 255]);
+        b.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        b.extend_from_slice(params);
+        b
+    }
+
+    #[test]
+    fn extended_open_accepts_short_long_and_multiple_parameters() {
+        let (c, p, _) = fixture();
+        // Separate parameters for four-octet ASN and IPv4 MP capability.
+        let mut params = vec![2, 0, 6, 65, 4];
+        params.extend_from_slice(&p.remote_asn.to_be_bytes());
+        params.extend_from_slice(&[2, 0, 6, 1, 4, 0, 1, 0, 1]);
+        for legacy_length in [1, 254, 255] {
+            let mut b = extended_open(&c, &p, &params);
+            b[9] = legacy_length;
+            let n = parse_open(&b, &c, &p).unwrap();
+            assert!(n.asn4 && n.ipv4);
+        }
+        // A single parameter larger than 255 bytes, with one-byte capability lengths.
+        let mut caps = vec![65, 4];
+        caps.extend_from_slice(&p.remote_asn.to_be_bytes());
+        caps.extend_from_slice(&[1, 4, 0, 1, 0, 1, 200, 250]);
+        caps.extend([0; 250]);
+        let mut params = vec![2];
+        params.extend_from_slice(&(caps.len() as u16).to_be_bytes());
+        params.extend(caps);
+        let b = extended_open(&c, &p, &params);
+        assert!(b.len() > 255);
+        let n = parse_open(&b, &c, &p).unwrap();
+        assert!(n.asn4 && n.ipv4);
+        let empty = parse_open(&extended_open(&c, &p, &[]), &c, &p).unwrap();
+        assert!(empty.ipv4 && !empty.asn4);
+    }
+
+    #[test]
+    fn extended_open_rejects_truncation_and_inconsistent_nested_lengths() {
+        let (c, p, _) = fixture();
+        let b = extended_open(&c, &p, &[2, 0, 6, 1, 4, 0, 1, 0, 1]);
+        for length in 0..b.len() {
+            assert!(parse_open(&b[..length], &c, &p).is_err(), "{length}");
+        }
+        for (position, value) in [(9, 0), (12, 8), (12, 10), (15, 5), (15, 7), (17, 5)] {
+            let mut bad = b.clone();
+            bad[position] = value;
+            assert!(parse_open(&bad, &c, &p).is_err(), "{position}={value}");
         }
     }
 }
