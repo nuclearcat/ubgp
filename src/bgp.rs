@@ -201,7 +201,12 @@ async fn handshake(
     }
 }
 
-/// Select an incoming or outgoing OPEN candidate using the router-ID preference.
+/// Prefer the larger router ID's connection, breaking equal external IDs by ASN.
+fn prefer_incoming(cfg: &Config, p: &Peer, n: &Negotiated) -> bool {
+    (cfg.router_id, cfg.asn) < (n.router_id, p.remote_asn)
+}
+
+/// Select an incoming or outgoing OPEN candidate using the router-ID/ASN preference.
 /// Allow a short collision window for the other direction; abort unused candidates.
 async fn choose(
     cfg: Arc<Config>,
@@ -238,7 +243,7 @@ async fn choose(
                         // RFC 4271 collision preference: the larger BGP ID keeps
                         // the connection it initiated. Give a concurrent OPEN a
                         // short settling window before using the other direction.
-                        let prefer_incoming = cfg.router_id < candidate.negotiated.router_id;
+                        let prefer_incoming = prefer_incoming(&cfg, &p, &candidate.negotiated);
                         if candidate.incoming == prefer_incoming {
                             if let Some(mut old) = pending.take() { let _ = send(&mut old.stream,&wire::notification(6,7,&[]),1).await; }
                             return Ok(candidate);
@@ -937,5 +942,21 @@ mod tests {
         assert_eq!(replayed, prefixes);
         task.abort();
         let _ = task.await;
+    }
+    #[test]
+    fn collision_uses_full_asn_only_when_identifiers_match() {
+        let mut c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let mut p = c.peers[0].clone();
+        let mut negotiated = n();
+        negotiated.router_id = c.router_id;
+        c.asn = 4_200_000_001;
+        p.remote_asn = 4_200_000_002;
+        assert!(prefer_incoming(&c, &p, &negotiated));
+        std::mem::swap(&mut c.asn, &mut p.remote_asn);
+        assert!(!prefer_incoming(&c, &p, &negotiated));
+        negotiated.router_id = "255.255.255.255".parse().unwrap();
+        assert!(prefer_incoming(&c, &p, &negotiated));
+        negotiated.router_id = "0.0.0.1".parse().unwrap();
+        assert!(!prefer_incoming(&c, &p, &negotiated));
     }
 }

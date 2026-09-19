@@ -158,6 +158,10 @@ impl Acl {
 pub fn valid_v4(a: Ipv4Addr) -> bool {
     !a.is_unspecified() && !a.is_multicast() && a != Ipv4Addr::BROADCAST
 }
+/// A BGP identifier is a nonzero integer, not necessarily an IPv4 host address.
+pub fn valid_router_id(id: Ipv4Addr) -> bool {
+    !id.is_unspecified()
+}
 /// Reject unspecified and multicast IPv6 addresses; link-local addresses are allowed.
 pub fn valid_v6(a: Ipv6Addr) -> bool {
     !a.is_unspecified() && !a.is_multicast()
@@ -214,7 +218,7 @@ impl Config {
             self.asn != 0 && self.asn != 23456,
             "local ASN must be nonzero and not AS_TRANS"
         );
-        ensure!(valid_v4(self.router_id), "invalid router_id");
+        ensure!(valid_router_id(self.router_id), "router_id must be nonzero");
         ensure!(self.listen_port != 0, "listen_port must be nonzero");
         ensure!(!self.peers.is_empty(), "at least one peer is required");
         ensure!(
@@ -407,5 +411,17 @@ mod tests {
         c.peers[0].ipv6 = true;
         assert!(c.validate().is_err());
         assert!(toml::from_str::<Config>(&text.replace("export_acl = \"export\"", "")).is_err());
+    }
+    #[test]
+    fn router_ids_are_nonzero_integers_without_relaxing_addresses() {
+        let mut c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        for id in ["0.0.0.1", "224.0.0.1", "255.255.255.255"] {
+            c.router_id = id.parse().unwrap();
+            c.validate().unwrap();
+        }
+        c.router_id = "0.0.0.0".parse().unwrap();
+        assert!(c.validate().is_err());
+        assert!(!valid_v4("224.0.0.1".parse().unwrap()));
+        assert!(!valid_v4("255.255.255.255".parse().unwrap()));
     }
 }

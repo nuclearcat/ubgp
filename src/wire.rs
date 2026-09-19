@@ -1,5 +1,5 @@
 //! Small bounded BGP codec. No received route is installed or re-exported.
-use crate::config::{Config, Peer, valid_v4};
+use crate::config::{Config, Peer, valid_router_id, valid_v4};
 use anyhow::{Result, ensure};
 use ipnet::IpNet;
 use std::{fmt, net::Ipv4Addr};
@@ -159,7 +159,7 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
     require(hold == 0 || hold >= 3, 2, 6, "unacceptable hold time")?;
     let router_id = Ipv4Addr::new(b[5], b[6], b[7], b[8]);
     require(
-        valid_v4(router_id) && router_id != cfg.router_id,
+        valid_router_id(router_id) && (cfg.asn != p.remote_asn || router_id != cfg.router_id),
         2,
         3,
         "invalid or duplicate router ID",
@@ -861,5 +861,28 @@ mod tests {
             validate_update(&received_update(true, &[0x40, 5, 4, 0, 0, 0, 100]), &n).unwrap(),
             UpdateAction::Valid
         );
+    }
+    #[test]
+    fn open_accepts_integer_ids_and_equal_external_ids_only() {
+        let (c, mut p, _) = fixture();
+        for internal in [false, true] {
+            if internal {
+                p.remote_asn = c.asn;
+            }
+            for id in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "192.0.2.1"] {
+                let mut remote = c.clone();
+                remote.asn = p.remote_asn;
+                remote.router_id = id.parse().unwrap();
+                let packet = open(&remote, &p);
+                let result = parse_open(&packet[19..], &c, &p);
+                let rejected = id == "0.0.0.0" || (internal && remote.router_id == c.router_id);
+                assert_eq!(result.is_err(), rejected, "{id}, internal={internal}");
+                if rejected {
+                    let error = result.unwrap_err();
+                    let error = error.downcast_ref::<ProtocolError>().unwrap();
+                    assert_eq!((error.code, error.subcode), (2, 3));
+                }
+            }
+        }
     }
 }
