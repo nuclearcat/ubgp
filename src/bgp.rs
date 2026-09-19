@@ -182,7 +182,7 @@ async fn handshake(
         info!(peer = %p.address, incoming, "BGP OpenSent: waiting for peer OPEN");
         let (kind, body) = wire::read_frame(&mut stream).await?;
         if kind != 1 {
-            return Err(wire::unexpected(kind, &body));
+            return Err(wire::unexpected(wire::FsmState::OpenSent, kind, &body));
         }
         wire::parse_open(&body, &cfg, &p)
     };
@@ -332,7 +332,13 @@ async fn receive(
                     refresh.request(v6);
                 }
             }
-            other => return Err(wire::unexpected(other, &packet.1)),
+            other => {
+                return Err(wire::unexpected(
+                    wire::FsmState::Established,
+                    other,
+                    &packet.1,
+                ));
+            }
         }
         // An inbound route flood cannot monopolize a runtime worker.
         tokio::task::yield_now().await;
@@ -534,7 +540,7 @@ async fn session(
         }
     };
     if kind != wire::KEEPALIVE {
-        let e = wire::unexpected(kind, &body);
+        let e = wire::unexpected(wire::FsmState::OpenConfirm, kind, &body);
         report(&mut candidate.stream, &e).await;
         return Err(e);
     }
@@ -975,5 +981,19 @@ mod tests {
             let error = choose(Arc::new(c.clone()), p, &mut rx).await.err().unwrap();
             assert!(error.to_string().contains("deadline"), "{error:#}");
         }
+    }
+    #[tokio::test]
+    async fn established_state_reports_unexpected_open_on_wire() {
+        let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
+        let input = wire::open(&c, &c.peers[0]);
+        let error = receive(&mut input.as_slice(), &n(), &Refresh::default())
+            .await
+            .unwrap_err();
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        report(&mut writer, &error).await;
+        assert_eq!(
+            wire::read_frame(&mut reader).await.unwrap(),
+            (3, vec![5, 3, 1])
+        );
     }
 }

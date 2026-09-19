@@ -203,7 +203,15 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
         };
         let end = parameter_header + length;
         require(end <= params.len(), 2, 0, "invalid optional parameter")?;
-        require(params[0] == 2, 2, 4, "unsupported optional parameter")?;
+        if params[0] != 2 {
+            return Err(ProtocolError {
+                code: 2,
+                subcode: 4,
+                data: params[..end].to_vec(),
+                reason: "unsupported optional parameter",
+            }
+            .into());
+        }
         // Capability lengths remain one octet even inside extended parameters.
         let mut caps = &params[parameter_header..end];
         while !caps.is_empty() {
@@ -261,7 +269,22 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
         ipv4: p.ipv4 && (v4 || !mp),
         ipv6: p.ipv6 && v6,
     };
-    require(n.ipv4 || n.ipv6, 2, 7, "no common address family")?;
+    if !n.ipv4 && !n.ipv6 {
+        let mut data = Vec::new();
+        if p.ipv4 {
+            data.extend_from_slice(&[1, 4, 0, 1, 0, 1]);
+        }
+        if p.ipv6 {
+            data.extend_from_slice(&[1, 4, 0, 2, 0, 1]);
+        }
+        return Err(ProtocolError {
+            code: 2,
+            subcode: 7,
+            data,
+            reason: "no common address family",
+        }
+        .into());
+    }
     Ok(n)
 }
 
@@ -523,7 +546,15 @@ pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<UpdateAction> {
                 18 => l == 8,
                 32 => l != 0 && l % 12 == 0,
                 _ => {
-                    require(flags & 0x80 != 0, 3, 2, "unknown well-known attribute")?;
+                    if flags & 0x80 == 0 {
+                        return Err(ProtocolError {
+                            code: 3,
+                            subcode: 2,
+                            data: attrs[..h + l].to_vec(),
+                            reason: "unknown well-known attribute",
+                        }
+                        .into());
+                    }
                     true
                 }
             };
@@ -627,8 +658,17 @@ pub fn refresh_family(b: &[u8], n: &Negotiated) -> Result<Option<bool>> {
         _ => Ok(None),
     }
 }
-/// Describe a peer NOTIFICATION without triggering a reply, or create a state error.
-pub fn unexpected(kind: u8, body: &[u8]) -> anyhow::Error {
+/// State-specific subcodes for unexpected messages, as defined by RFC 6608.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum FsmState {
+    OpenSent = 1,
+    OpenConfirm = 2,
+    Established = 3,
+}
+
+/// Describe a peer NOTIFICATION without replying, or include state and type in an error.
+pub fn unexpected(state: FsmState, kind: u8, body: &[u8]) -> anyhow::Error {
     if kind == 3 {
         if body.len() >= 2 {
             anyhow::anyhow!(
@@ -640,7 +680,13 @@ pub fn unexpected(kind: u8, body: &[u8]) -> anyhow::Error {
             anyhow::anyhow!("peer sent truncated NOTIFICATION")
         }
     } else {
-        err(5, 0, "unexpected message in BGP state")
+        ProtocolError {
+            code: 5,
+            subcode: state as u8,
+            data: vec![kind],
+            reason: "unexpected message in BGP state",
+        }
+        .into()
     }
 }
 
@@ -1002,5 +1048,73 @@ mod tests {
             }
         }
         assert_eq!(&end_of_rib(true)[19..], &[0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1]);
+    }
+    /// Assert exact NOTIFICATION payload bytes, including RFC-required error data.
+    fn notification_data(error: anyhow::Error, expected: &[u8]) {
+        let e = error.downcast_ref::<ProtocolError>().unwrap();
+        let packet = notification(e.code, e.subcode, &e.data);
+        assert_eq!(&packet[..16], &[255; 16]);
+        assert_eq!(u16b(&packet[16..]) as usize, 19 + expected.len());
+        assert_eq!(packet[18], 3);
+        assert_eq!(&packet[19..], expected);
+    }
+
+    #[test]
+    fn notifications_include_capabilities_and_offending_attributes() {
+        let (c, mut p, n) = fixture();
+        let mut remote = c.clone();
+        remote.asn = p.remote_asn;
+        remote.router_id = "192.0.2.2".parse().unwrap();
+        let packet = open(&remote, &p);
+        p.ipv4 = false;
+        p.ipv6 = true;
+        notification_data(
+            parse_open(&packet[19..], &c, &p).unwrap_err(),
+            &[2, 7, 1, 4, 0, 2, 0, 1],
+        );
+        let mut remote_peer = p.clone();
+        remote_peer.ipv4 = false;
+        remote_peer.ipv6 = false;
+        // Advertise an unsupported family so legacy IPv4 fallback does not apply.
+        let mut unsupported = open(&remote, &remote_peer)[19..].to_vec();
+        unsupported[9] += 6;
+        unsupported[11] += 6;
+        unsupported.extend_from_slice(&[1, 4, 0, 25, 0, 70]);
+        p.ipv4 = true;
+        notification_data(
+            parse_open(&unsupported, &c, &p).unwrap_err(),
+            &[2, 7, 1, 4, 0, 1, 0, 1, 1, 4, 0, 2, 0, 1],
+        );
+        for attr in [vec![0x40, 99, 1, 42], vec![0x50, 99, 0, 1, 42]] {
+            let mut expected = vec![3, 2];
+            expected.extend_from_slice(&attr);
+            notification_data(
+                validate_update(&received_update(true, &attr), &n).unwrap_err(),
+                &expected,
+            );
+        }
+        let mut optional = packet[19..29].to_vec();
+        optional[9] = 3;
+        optional.extend_from_slice(&[99, 1, 42]);
+        notification_data(
+            parse_open(&optional, &c, &p).unwrap_err(),
+            &[2, 4, 99, 1, 42],
+        );
+    }
+
+    #[test]
+    fn fsm_notifications_identify_state_and_unexpected_message() {
+        for (state, subcode, kind) in [
+            (FsmState::OpenSent, 1, 4),
+            (FsmState::OpenConfirm, 2, 2),
+            (FsmState::Established, 3, 1),
+        ] {
+            notification_data(unexpected(state, kind, &[]), &[5, subcode, kind]);
+            assert!(
+                unexpected(state, 3, &[6, 0])
+                    .downcast_ref::<ProtocolError>()
+                    .is_none()
+            );
+        }
     }
 }
