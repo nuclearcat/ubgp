@@ -640,6 +640,10 @@ async fn peer_loop(
 
 /// Run peer workers and shared listeners, dispatching only configured remote addresses.
 /// `statuses` must correspond to `cfg.peers` in order; any worker exit ends this task.
+///
+/// # Errors
+/// Returns listener setup errors, unexpected worker exits, or worker panics.
+/// Transient peer connection errors are retried by the individual workers.
 pub async fn run(
     cfg: Arc<Config>,
     exports: watch::Receiver<Arc<Exports>>,

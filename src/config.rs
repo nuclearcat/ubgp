@@ -187,6 +187,9 @@ impl Peer {
 }
 impl Config {
     /// Read, parse, and validate a TOML configuration without exposing source in errors.
+    ///
+    /// # Errors
+    /// Returns file I/O, TOML syntax/type, or configuration validation errors.
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -208,6 +211,9 @@ impl Config {
     }
     /// Check configuration bounds, ACL references, peer uniqueness, and address families.
     /// Interface existence and local address ownership are checked when connecting.
+    ///
+    /// # Errors
+    /// Returns the first invalid setting or incompatible combination of settings.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.management.listen.ip().is_loopback(),

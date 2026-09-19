@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Linux announce-only BGP daemon with mandatory export ACLs"
 license = "MIT"
+repository = "https://github.com/nuclearcat/ubgp"
 
 [dependencies]
 anyhow = "1.0"

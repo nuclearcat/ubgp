@@ -92,3 +92,31 @@ oversized input isolation, listener changes and client closure on SIGHUP,
 disabling the listener, and rejecting non-loopback bind addresses. Live BIRD
 tests queried Established state and exact ACL export candidates for outgoing,
 incoming, IPv4/IPv6, simultaneous, and MD5-authenticated sessions.
+
+## Standards fixes — 2026-09-19
+
+All 40 Rust unit tests passed (17 added regressions); the million-route scale
+benchmark remains explicitly ignored. Formatting, Clippy with warnings denied,
+and rustdoc with warnings denied passed. The new crate-level ACL example also
+passed as a doctest.
+
+Regression tests cover recoverable UPDATE attributes and fatal NLRI boundaries,
+AS4 attribute discard, receive-loop survival, delayed/coalesced refreshes,
+family-specific refresh dispatch, replay progress across snapshot changes,
+nonzero integer BGP identifiers, equal-ID ASN collision preference, short/long
+extended OPEN parameters and truncation, configuration timeout bounds and checked
+deadline failures, outgoing MP attribute order, and exact NOTIFICATION data.
+Refresh timing uses Tokio's paused test clock, including replay under backpressure.
+
+The Docker unit/CLI/management suite and the full BIRD/TCP-MD5 integration suite
+passed with networking disabled. Live coverage included eBGP/iBGP, IPv4/IPv6,
+simultaneous connections, four-byte ASNs, route changes, stale withdrawal,
+10,000-route notification loss and recovery, authenticated/unsigned peers,
+key rotation/removal, and shared listeners. The test image was built offline
+from the existing `ubgp-test` image with updated source and test files. No host
+networking, host mounts, or host interface changes were used.
+
+The final documentation-only changes and new doctest were checked locally after
+the container image was built. The larger scale suite was not rerun. These checks
+cover the repaired behaviors and interoperability; they do not certify every BGP
+RFC requirement.

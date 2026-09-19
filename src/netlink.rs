@@ -457,6 +457,9 @@ fn snapshot(
 
 /// Build one shared prefix set per referenced export ACL from a kernel snapshot.
 /// Requires validated configuration so every peer's ACL exists.
+///
+/// # Panics
+/// Panics if a peer references an ACL absent from `cfg.acls`.
 pub fn filter(cfg: &Config, prefixes: &Prefixes) -> Exports {
     cfg.peers
         .iter()
@@ -537,6 +540,10 @@ impl Drop for Watchdog {
 ///
 /// All memory queues are constant-size; route storage is capped by max_prefixes.
 /// Watch channels retain only the latest complete export, shared among peers.
+///
+/// # Errors
+/// Returns socket setup, watchdog startup, polling, or deadline overflow errors.
+/// Incomplete dumps are retried, with stale exports withdrawn independently.
 pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBool>) -> Result<()> {
     let groups = 1 | 0x10 | 0x40 | if cfg.ipv6 { 0x100 | 0x400 } else { 0 };
     let events = Socket::open(groups, cfg.kernel.receive_buffer_bytes)

@@ -65,6 +65,10 @@ pub fn notification(code: u8, subcode: u8, data: &[u8]) -> Vec<u8> {
 /// Read one frame, validating its marker, type, and length before allocating the body.
 /// Returns the type and body without the header; callers must impose any deadline.
 /// Cancellation may consume a partial frame, so do not resume on the same stream.
+///
+/// # Errors
+/// Returns I/O errors (including early EOF), or [`ProtocolError`] for an invalid
+/// marker, message type, or length. Message bodies need type-specific validation.
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 19];
     reader.read_exact(&mut header).await?;
@@ -143,6 +147,10 @@ pub fn open(cfg: &Config, peer: &Peer) -> Vec<u8> {
 }
 /// Validate an OPEN body against the expected peer and negotiate hold time and families.
 /// Peers without multiprotocol capabilities may use legacy IPv4 unicast.
+///
+/// # Errors
+/// Returns [`ProtocolError`] for malformed parameters, invalid version/ID/hold time,
+/// a mismatched peer ASN, or absence of a required common address family.
 pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
     require(b.len() >= 10, 2, 0, "short OPEN")?;
     if b[0] != 4 {
@@ -646,6 +654,9 @@ pub(crate) fn update_prefixes(b: &[u8]) -> Vec<IpNet> {
 }
 /// Decode a basic unicast refresh: `Some(true)` for IPv6, `Some(false)` for IPv4.
 /// Ignore unsupported subtypes and families; reject bodies that are not four bytes.
+///
+/// # Errors
+/// Returns an error if the body length is not exactly four bytes.
 pub fn refresh_family(b: &[u8], n: &Negotiated) -> Result<Option<bool>> {
     ensure!(b.len() == 4, "invalid ROUTE-REFRESH length");
     // Enhanced route refresh is not advertised. Ignore unknown subtypes/SAFIs.

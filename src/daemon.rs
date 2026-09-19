@@ -8,6 +8,9 @@ use tracing_subscriber::fmt::MakeWriter;
 
 /// Fork into the background, change directory to `/`, and redirect standard I/O.
 /// Call only from the single-threaded startup path, before Tokio or tracing.
+///
+/// # Errors
+/// Returns the operating system error if daemonization fails.
 pub fn detach() -> Result<()> {
     // SAFETY: no runtime, worker threads, or logging locks exist at this point.
     // libc daemon forks, calls setsid, changes cwd to /, and redirects 0/1/2
@@ -20,6 +23,9 @@ pub fn detach() -> Result<()> {
 
 /// Initialize tracing with syslog in the background or console output in the foreground.
 /// Explicit debug mode overrides `RUST_LOG`; otherwise the default level is info.
+///
+/// # Panics
+/// Panics if a global tracing subscriber has already been installed.
 pub fn init_logging(background: bool, debug: bool) {
     let filter = if debug {
         "ubgp=debug".into()

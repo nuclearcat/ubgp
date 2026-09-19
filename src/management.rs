@@ -33,6 +33,9 @@ pub fn statuses(cfg: &Config) -> Vec<Status> {
         .collect()
 }
 /// Set the state and reset its age, preserving the last error when none is supplied.
+///
+/// # Panics
+/// Panics if the shared status mutex was poisoned by an earlier panic.
 pub fn update(status: &Status, state: &'static str, error: Option<String>) {
     let mut status = status.lock().unwrap();
     status.state = state;
@@ -43,6 +46,9 @@ pub fn update(status: &Status, state: &'static str, error: Option<String>) {
 }
 
 /// Bind the validated management address, or return `None` when disabled.
+///
+/// # Errors
+/// Returns a socket binding error when the enabled console cannot listen.
 pub async fn bind(cfg: &Config) -> Result<Option<TcpListener>> {
     if !cfg.management.enabled {
         return Ok(None);
@@ -56,6 +62,9 @@ pub async fn bind(cfg: &Config) -> Result<Option<TcpListener>> {
 
 /// Serve at most 16 loopback clients, isolating individual console failures.
 /// With no listener, remain pending until the supervisor cancels this task.
+///
+/// # Errors
+/// Returns a listener accept error. Individual client errors only close that client.
 pub async fn run(
     listener: Option<TcpListener>,
     cfg: Arc<Config>,
