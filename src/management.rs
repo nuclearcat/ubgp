@@ -19,6 +19,7 @@ pub struct PeerStatus {
     pub last_error: Option<String>,
 }
 pub type Status = Arc<Mutex<PeerStatus>>;
+/// Create shared Idle status records in configuration peer order.
 pub fn statuses(cfg: &Config) -> Vec<Status> {
     cfg.peers
         .iter()
@@ -31,6 +32,7 @@ pub fn statuses(cfg: &Config) -> Vec<Status> {
         })
         .collect()
 }
+/// Set the state and reset its age, preserving the last error when none is supplied.
 pub fn update(status: &Status, state: &'static str, error: Option<String>) {
     let mut status = status.lock().unwrap();
     status.state = state;
@@ -40,6 +42,7 @@ pub fn update(status: &Status, state: &'static str, error: Option<String>) {
     }
 }
 
+/// Bind the validated management address, or return `None` when disabled.
 pub async fn bind(cfg: &Config) -> Result<Option<TcpListener>> {
     if !cfg.management.enabled {
         return Ok(None);
@@ -51,6 +54,8 @@ pub async fn bind(cfg: &Config) -> Result<Option<TcpListener>> {
     Ok(Some(listener))
 }
 
+/// Serve at most 16 loopback clients, isolating individual console failures.
+/// With no listener, remain pending until the supervisor cancels this task.
 pub async fn run(
     listener: Option<TcpListener>,
     cfg: Arc<Config>,
@@ -76,13 +81,15 @@ pub async fn run(
     }
 }
 
+/// Write a complete console response with a five-second deadline.
 async fn write(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     timeout(Duration::from_secs(5), stream.write_all(bytes))
         .await
         .context("CLI write timeout")??;
     Ok(())
 }
-// Terminal-safe output, including peer-supplied/error text; never render config Debug.
+/// Replace non-ASCII and control characters with `?` for terminal-safe output.
+/// Use for peer-supplied/error text; never render configuration Debug output.
 fn safe(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -96,6 +103,8 @@ fn safe(text: &str) -> String {
 }
 const HELP: &str = "help                       Show commands\r\nshow summary               Router and session summary\r\nshow peers                 Peer state, state age and last error\r\nshow routes ACL [PREFIX]    ACL export candidates (maximum 100; not advertised RIB)\r\nquit / exit                Close console\r\n";
 
+/// Handle one read-only console with input deadlines and bounded route listings.
+/// Route output reflects ACL candidates, not confirmed peer advertisements.
 async fn console(
     mut stream: TcpStream,
     cfg: Arc<Config>,
@@ -220,6 +229,9 @@ async fn console(
     }
 }
 
+/// Read an ASCII command while refusing Telnet options and processing backspaces.
+/// Preserve CR-LF/CR-NUL handling across calls via `skip_lf`; return `None` at EOF.
+/// Reject commands over 512 bytes or input exceeding 8192 wire bytes per call.
 async fn line(stream: &mut TcpStream, skip_lf: &mut bool) -> Result<Option<String>> {
     let mut bytes = Vec::new();
     let mut state = 0;

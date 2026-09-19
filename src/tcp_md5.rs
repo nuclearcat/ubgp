@@ -1,13 +1,9 @@
 //! Linux TCP-MD5 configuration. Keys are installed before connect/listen;
 //! accepted sockets inherit authentication from the listening socket.
-use crate::config::Peer;
+use crate::{config::Peer, transport::endpoint};
 use anyhow::{Context, Result, ensure};
 use socket2::SockAddr;
-use std::{
-    io, mem,
-    net::{IpAddr, SocketAddr, SocketAddrV6},
-    os::fd::AsRawFd,
-};
+use std::{io, mem, os::fd::AsRawFd};
 
 // Linux UAPI tcp_md5sig, including the reserved/extended fields. libc exposes
 // TCP_MD5SIG and MAXKEYLEN but does not expose this structure on all targets.
@@ -21,6 +17,8 @@ struct Signature {
     key: [u8; libc::TCP_MD5SIG_MAXKEYLEN],
 }
 
+/// Install the peer's TCP-MD5 key before connect or listen; do nothing if none is set.
+/// Use `index` to scope link-local addresses and erase the temporary key buffer.
 pub(crate) fn install(socket: &impl AsRawFd, peer: &Peer, index: u32) -> Result<()> {
     let Some(key) = &peer.md5_password else {
         return Ok(());
@@ -29,13 +27,7 @@ pub(crate) fn install(socket: &impl AsRawFd, peer: &Peer, index: u32) -> Result<
         (1..=libc::TCP_MD5SIG_MAXKEYLEN).contains(&key.as_bytes().len()),
         "invalid TCP-MD5 key length"
     );
-    let address = match peer.address {
-        IpAddr::V6(a) if a.is_unicast_link_local() => {
-            SocketAddr::V6(SocketAddrV6::new(a, 0, 0, index))
-        }
-        a => SocketAddr::new(a, 0),
-    };
-    let address = SockAddr::from(address);
+    let address = SockAddr::from(endpoint(peer.address, 0, index));
     // SAFETY: all-zero storage is valid for the UAPI fields; zero reserved
     // fields select an exact peer address with ordinary TCP_MD5SIG semantics.
     let mut signature: Signature = unsafe { mem::zeroed() };

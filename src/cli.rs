@@ -29,6 +29,8 @@ pub enum Command {
     },
 }
 
+/// Parse arguments after the executable name, preserving non-UTF-8 config paths.
+/// Reject unknown options and missing values; help and version return immediately.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     let mut path = PathBuf::from("/etc/ubgp.toml");
     let mut daemon = false;

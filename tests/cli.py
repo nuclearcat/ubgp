@@ -21,6 +21,7 @@ def command(*args, cwd=None):
 
 
 def wait_for(label, predicate):
+    """Poll for up to eight seconds, printing success or raising a labeled assertion."""
     end = time.monotonic() + 8
     while time.monotonic() < end:
         if predicate():
@@ -45,6 +46,7 @@ def listening(port):
 
 
 def processes(config_name):
+    """Find ubgp PIDs whose command lines contain the configuration name."""
     found = []
     for entry in Path("/proc").iterdir():
         if entry.name.isdigit():
@@ -73,6 +75,7 @@ sock.settimeout(0.1)
 
 
 def collect():
+    """Collect local syslog datagrams until the test signals this thread to stop."""
     while not stopping.is_set():
         try:
             logs.append(sock.recv(65536).decode(errors="replace"))

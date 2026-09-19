@@ -6,6 +6,7 @@ use std::{
 use tracing::{Level, Metadata};
 use tracing_subscriber::fmt::MakeWriter;
 
+/// Fork into the background, change directory to `/`, and redirect standard I/O.
 /// Call only from the single-threaded startup path, before Tokio or tracing.
 pub fn detach() -> Result<()> {
     // SAFETY: no runtime, worker threads, or logging locks exist at this point.
@@ -17,6 +18,8 @@ pub fn detach() -> Result<()> {
     Ok(())
 }
 
+/// Initialize tracing with syslog in the background or console output in the foreground.
+/// Explicit debug mode overrides `RUST_LOG`; otherwise the default level is info.
 pub fn init_logging(background: bool, debug: bool) {
     let filter = if debug {
         "ubgp=debug".into()
@@ -56,6 +59,7 @@ impl<'a> MakeWriter<'a> for Syslog {
             priority: libc::LOG_INFO,
         }
     }
+    /// Map tracing severity to the syslog priority of the buffered event.
     fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Event {
         let priority = match *meta.level() {
             Level::ERROR => libc::LOG_ERR,
@@ -70,16 +74,19 @@ impl<'a> MakeWriter<'a> for Syslog {
     }
 }
 impl Write for Event {
+    /// Buffer an event, replacing NUL bytes so it can be passed to syslog as a C string.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.bytes
             .extend(bytes.iter().map(|b| if *b == 0 { b'?' } else { *b }));
         Ok(bytes.len())
     }
+    /// Leave the buffer intact; the complete event is emitted on drop.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 impl Drop for Event {
+    /// Emit one complete event through a fixed syslog format string.
     fn drop(&mut self) {
         if self.bytes.is_empty() {
             return;

@@ -13,6 +13,7 @@ BIN = '/work/target/release/ubgp'
 
 
 def wait(label, predicate):
+    """Poll for up to ten seconds, printing success or raising a labeled assertion."""
     until = time.monotonic() + 10
     while time.monotonic() < until:
         if predicate():
@@ -23,6 +24,7 @@ def wait(label, predicate):
 
 
 def prompt(sock):
+    """Read through the console prompt, rejecting early EOF or an oversized response."""
     data = b''
     while not data.endswith(b'ubgp> '):
         chunk = sock.recv(4096)
@@ -33,6 +35,7 @@ def prompt(sock):
 
 
 def command(sock, text):
+    """Send a CR-LF-terminated console command and return its decoded response."""
     sock.sendall(text.encode() + b'\r\n')
     return prompt(sock).decode()
 
@@ -50,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix='ubgp-management-') as directory:
     clients = []
     try:
         def ready():
+            """Keep the first successful console connection while checking daemon liveness."""
             assert proc.poll() is None
             try:
                 s = socket.create_connection(('127.0.0.1', 65090), timeout=1)
@@ -87,6 +91,7 @@ with tempfile.TemporaryDirectory(prefix='ubgp-management-') as directory:
         os.kill(proc.pid, signal.SIGHUP)
         assert s.recv(1024) == b''
         def new_listener():
+            """Probe the reloaded listener and verify summary and quit commands."""
             try:
                 with socket.create_connection(('127.0.0.1', 65091), timeout=1) as new:
                     prompt(new)

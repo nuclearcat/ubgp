@@ -141,6 +141,8 @@ pub enum Action {
 }
 
 impl Acl {
+    /// Apply the first matching prefix/length rule, denying when no rule matches.
+    /// Omitted length bounds require the rule's exact prefix length.
     pub fn permits(&self, prefix: &IpNet) -> bool {
         self.rules
             .iter()
@@ -152,19 +154,23 @@ impl Acl {
             .is_some_and(|r| r.action == Action::Permit)
     }
 }
+/// Reject unspecified, multicast, and limited-broadcast IPv4 addresses.
 pub fn valid_v4(a: Ipv4Addr) -> bool {
     !a.is_unspecified() && !a.is_multicast() && a != Ipv4Addr::BROADCAST
 }
+/// Reject unspecified and multicast IPv6 addresses; link-local addresses are allowed.
 pub fn valid_v6(a: Ipv6Addr) -> bool {
     !a.is_unspecified() && !a.is_multicast()
 }
 impl Peer {
+    /// Use the explicit IPv4 next hop, falling back to an IPv4 local transport address.
     pub fn nh4(&self) -> Option<Ipv4Addr> {
         self.next_hop_v4.or(match self.local_address {
             IpAddr::V4(a) => Some(a),
             _ => None,
         })
     }
+    /// Use the explicit IPv6 next hop, falling back to an IPv6 local transport address.
     pub fn nh6(&self) -> Option<Ipv6Addr> {
         self.next_hop_v6.or(match self.local_address {
             IpAddr::V6(a) => Some(a),
@@ -173,6 +179,7 @@ impl Peer {
     }
 }
 impl Config {
+    /// Read, parse, and validate a TOML configuration without exposing source in errors.
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -180,6 +187,7 @@ impl Config {
         cfg.validate()?;
         Ok(cfg)
     }
+    /// Deserialize TOML, replacing parser errors with locations that cannot reveal keys.
     fn parse(text: &str) -> Result<Self> {
         toml::from_str(text).map_err(|error: toml::de::Error| {
             // TOML's rendered errors include source lines, and even its message
@@ -191,6 +199,8 @@ impl Config {
             anyhow::anyhow!("parsing configuration at line {line}, column {column}: check TOML syntax, field names and types (source omitted to protect secrets)")
         })
     }
+    /// Check configuration bounds, ACL references, peer uniqueness, and address families.
+    /// Interface existence and local address ownership are checked when connecting.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.management.listen.ip().is_loopback(),

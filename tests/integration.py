@@ -18,6 +18,7 @@ assert Path("/.dockerenv").exists(), "Run this test inside Docker only"
 
 
 def run(*args, input=None):
+    """Return command stdout, raising with captured stdout and stderr on failure."""
     result = subprocess.run(args, input=input, text=True, capture_output=True)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
@@ -25,6 +26,7 @@ def run(*args, input=None):
 
 
 def wait_for(label, predicate, seconds=30):
+    """Poll until the predicate succeeds or raise a labeled timeout assertion."""
     start = time.monotonic()
     while time.monotonic() - start < seconds:
         if predicate():
@@ -36,6 +38,7 @@ def wait_for(label, predicate, seconds=30):
 
 class Lab:
     def __init__(self, path):
+        """Create an isolated BIRD namespace, veth pair, and fixture routes in Docker."""
         self.path = Path(path)
         self.processes = []
         self.handles = []
@@ -66,9 +69,11 @@ class Lab:
         run("ip", "-6", "route", "add", "2001:db8:100::/48", "dev", "lo", "table", "100")
 
     def peer(self, *args):
+        """Run a command in the BIRD peer's network namespace."""
         return run("nsenter", "-t", str(self.namespace.pid), "-n", *args)
 
     def spawn(self, name, *args):
+        """Start a tracked child with combined output appended to its named log."""
         output = (self.path / f"{name}.log").open("a")
         self.handles.append(output)
         p = subprocess.Popen(args, stdout=output, stderr=subprocess.STDOUT)
@@ -76,6 +81,7 @@ class Lab:
         return p
 
     def stop(self, p):
+        """Resume and terminate a live child, escalating to kill after the deadline."""
         if p is not None and p.poll() is None:
             p.send_signal(signal.SIGCONT)
             p.terminate()
@@ -87,9 +93,13 @@ class Lab:
 
     def configure(self, mode="outgoing", local_as=64512, remote_as=64513, v6_transport=False, maximum=64,
                   md5_password=None, bird_password=None, expect_established=True):
+        """Restart both speakers with the requested transport, direction, ASNs, and keys.
+
+        Unless expect_established is false, wait for the session and initial exports
+        and check lifecycle logs and management output.
+        """
         self.stop(self.ubgp)
         self.stop(self.bird)
-        self.mode = mode
         local = "2001:db8:ffff::1" if v6_transport else "192.0.2.1"
         remote = "2001:db8:ffff::2" if v6_transport else "192.0.2.2"
         md5_config = f'md5_password = "{md5_password}"' if md5_password is not None else ""
@@ -163,6 +173,7 @@ protocol bgp ubgp {{
         wait_for("connected IPv4 prefix", lambda: self.has("198.18.1.0/24"))
         with socket.create_connection(("127.0.0.1", 65090), timeout=3) as console:
             def response():
+                """Read one console response through its prompt, failing on early EOF."""
                 data = b""
                 while not data.endswith(b"ubgp> "):
                     chunk = console.recv(4096)
@@ -179,6 +190,7 @@ protocol bgp ubgp {{
         wait_for("IPv6 MP_REACH prefix", lambda: self.has("2001:db8:100::/48"))
 
     def control(self, command):
+        """Query BIRD, tolerating control failures during startup but not exited speakers."""
         if self.bird.poll() is not None or self.ubgp.poll() is not None:
             raise AssertionError("BGP process exited unexpectedly")
         try:
@@ -187,6 +199,7 @@ protocol bgp ubgp {{
             return ""
 
     def has(self, prefix):
+        """Check that BIRD learned the prefix from ubgp in the matching family table."""
         table = "master6" if ":" in prefix else "master4"
         text = self.control(f"show route table {table} {prefix} all")
         return prefix in text and "[ubgp " in text
@@ -198,6 +211,7 @@ protocol bgp ubgp {{
         run("ip", "route", "del", prefix, "table", str(table))
 
     def route_tests(self):
+        """Check export policy, deduplication, withdrawals, refresh, and rejected reloads."""
         for prefix in ["10.255.1.0/24", "10.2.0.0/24", "10.3.0.0/24", "0.0.0.0/0"]:
             assert not self.has(prefix), f"unexpected export: {prefix}"
         print("PASS ACL deny, unselected table, blackhole and implicit deny", flush=True)
@@ -231,6 +245,7 @@ protocol bgp ubgp {{
         (self.path / "ubgp.toml").write_text(self.config)
 
     def stale_test(self):
+        """Exceed the prefix cap and verify stale withdrawal followed by full recovery."""
         # Exceed max_prefixes without changing the running config/session.
         batch = "".join(f"route add 10.90.0.{n}/32 dev lo table 100\n" for n in range(100))
         run("ip", "-batch", "-", input=batch)
@@ -241,6 +256,7 @@ protocol bgp ubgp {{
         wait_for("successful resync restores exports", lambda: self.has("10.1.0.0/24"), 12)
 
     def loss_test(self, count=10000):
+        """Overflow notifications while ubgp is stopped, then verify dump-based recovery."""
         sentinel = "10.99.0.1/32"
         self.add(sentinel)
         wait_for("loss-test sentinel announced", lambda: self.has(sentinel))
@@ -264,6 +280,7 @@ protocol bgp ubgp {{
         print("ubgp memory:", "; ".join(re.findall(r"^Vm(?:RSS|HWM):.*$", status, re.M)), flush=True)
 
     def scale_interfaces(self):
+        """Create 8192 connected interfaces and wait for the final prefix to be exported."""
         count = 8192
         print(f"Creating {count} interfaces inside Docker", flush=True)
         start = time.monotonic()
@@ -274,6 +291,7 @@ protocol bgp ubgp {{
         wait_for("8192nd connected interface prefix exported", lambda: self.has("10.31.255.0/24"), 90)
 
     def close(self):
+        """Stop tracked children in reverse order and close their log handles."""
         for p in reversed(self.processes):
             self.stop(p)
         for h in self.handles:
@@ -281,6 +299,7 @@ protocol bgp ubgp {{
 
 
 def main():
+    """Run the Docker interoperability suite, dumping logs on failure and cleaning up."""
     with tempfile.TemporaryDirectory(prefix="ubgp-tests-") as directory:
         lab = None
         try:

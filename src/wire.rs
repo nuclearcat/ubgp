@@ -6,6 +6,8 @@ use std::{fmt, net::Ipv4Addr};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const MAX_MESSAGE: usize = 4096;
+// Keep even a full IPv6 batch with both next hops within MAX_MESSAGE.
+pub(crate) const MAX_UPDATE_PREFIXES: usize = 200;
 pub const KEEPALIVE: u8 = 4;
 pub const UPDATE: u8 = 2;
 pub const ROUTE_REFRESH: u8 = 5;
@@ -42,6 +44,10 @@ fn u16b(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
 
+/// Wrap a body in a BGP header with the standard marker and supplied message type.
+///
+/// # Panics
+/// Panics if the complete message exceeds [`MAX_MESSAGE`].
 pub fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
     assert!(body.len() + 19 <= MAX_MESSAGE);
     let mut out = vec![255u8; 16];
@@ -50,11 +56,15 @@ pub fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(body);
     out
 }
+/// Encode a NOTIFICATION, truncating error data to fit the standard message limit.
 pub fn notification(code: u8, subcode: u8, data: &[u8]) -> Vec<u8> {
     let mut b = vec![code, subcode];
     b.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 21)]);
     frame(3, &b)
 }
+/// Read one frame, validating its marker, type, and length before allocating the body.
+/// Returns the type and body without the header; callers must impose any deadline.
+/// Cancellation may consume a partial frame, so do not resume on the same stream.
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 19];
     reader.read_exact(&mut header).await?;
@@ -109,6 +119,7 @@ pub struct Negotiated {
     pub ipv4: bool,
     pub ipv6: bool,
 }
+/// Encode an OPEN advertising four-octet ASNs, route refresh, and enabled families.
 pub fn open(cfg: &Config, peer: &Peer) -> Vec<u8> {
     let mut caps = vec![65, 4];
     caps.extend_from_slice(&cfg.asn.to_be_bytes());
@@ -129,6 +140,8 @@ pub fn open(cfg: &Config, peer: &Peer) -> Vec<u8> {
     body.extend(caps);
     frame(1, &body)
 }
+/// Validate an OPEN body against the expected peer and negotiate hold time and families.
+/// Peers without multiprotocol capabilities may use legacy IPv4 unicast.
 pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
     require(b.len() >= 10, 2, 0, "short OPEN")?;
     if b[0] != 4 {
@@ -228,6 +241,7 @@ pub fn parse_open(b: &[u8], cfg: &Config, p: &Peer) -> Result<Negotiated> {
     Ok(n)
 }
 
+/// Append a path attribute, selecting the extended length field when needed.
 fn attr(out: &mut Vec<u8>, flags: u8, kind: u8, data: &[u8]) {
     out.push(flags | if data.len() > 255 { 0x10 } else { 0 });
     out.push(kind);
@@ -238,6 +252,7 @@ fn attr(out: &mut Vec<u8>, flags: u8, kind: u8, data: &[u8]) {
     }
     out.extend_from_slice(data);
 }
+/// Append a prefix length and the minimum network-address bytes required for NLRI.
 fn nlri(out: &mut Vec<u8>, p: &IpNet) {
     out.push(p.prefix_len());
     let n = (p.prefix_len() as usize).div_ceil(8);
@@ -246,6 +261,12 @@ fn nlri(out: &mut Vec<u8>, p: &IpNet) {
         IpNet::V6(p) => out.extend_from_slice(&p.network().octets()[..n]),
     }
 }
+/// Encode one announcement or withdrawal batch using the peer's next hops and ASN width.
+/// Announcements require a validated next hop for the batch's address family.
+///
+/// # Panics
+/// Panics for empty, mixed-family, or oversized batches, or a missing required next hop.
+/// A batch may contain at most 200 prefixes.
 pub fn update(
     cfg: &Config,
     p: &Peer,
@@ -253,7 +274,7 @@ pub fn update(
     prefixes: &[IpNet],
     withdraw: bool,
 ) -> Vec<u8> {
-    assert!(!prefixes.is_empty() && prefixes.len() <= 200);
+    assert!(!prefixes.is_empty() && prefixes.len() <= MAX_UPDATE_PREFIXES);
     let v6 = prefixes[0].addr().is_ipv6();
     assert!(prefixes.iter().all(|p| p.addr().is_ipv6() == v6));
     let mut encoded = Vec::new();
@@ -321,6 +342,7 @@ pub fn update(
     }
     frame(UPDATE, &body)
 }
+/// Encode an empty UPDATE marking end of RIB for IPv6 when `v6`, otherwise IPv4.
 pub fn end_of_rib(v6: bool) -> Vec<u8> {
     if v6 {
         frame(UPDATE, &[0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1])
@@ -329,6 +351,7 @@ pub fn end_of_rib(v6: bool) -> Vec<u8> {
     }
 }
 
+/// Check packed prefix lengths and available bytes for an address width in bits.
 fn validate_nlri(mut b: &[u8], bits: usize) -> Result<()> {
     while !b.is_empty() {
         let n = (b[0] as usize).div_ceil(8);
@@ -337,6 +360,7 @@ fn validate_nlri(mut b: &[u8], bits: usize) -> Result<()> {
     }
     Ok(())
 }
+/// Check AS_PATH segment types and lengths using a two- or four-byte ASN width.
 fn validate_path(mut b: &[u8], width: usize) -> Result<()> {
     while !b.is_empty() {
         require(
@@ -351,6 +375,8 @@ fn validate_path(mut b: &[u8], width: usize) -> Result<()> {
     }
     Ok(())
 }
+/// Check an UPDATE body's NLRI, attribute structure, and mandatory attributes.
+/// Use the negotiated ASN width without retaining or installing received routes.
 pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<()> {
     require(b.len() >= 4, 3, 1, "short UPDATE")?;
     let w = u16b(b) as usize;
@@ -467,6 +493,8 @@ pub fn validate_update(b: &[u8], n: &Negotiated) -> Result<()> {
     }
     Ok(())
 }
+/// Decode a basic unicast refresh: `Some(true)` for IPv6, `Some(false)` for IPv4.
+/// Ignore unsupported subtypes and families; reject bodies that are not four bytes.
 pub fn refresh_family(b: &[u8], n: &Negotiated) -> Result<Option<bool>> {
     ensure!(b.len() == 4, "invalid ROUTE-REFRESH length");
     // Enhanced route refresh is not advertised. Ignore unknown subtypes/SAFIs.
@@ -479,6 +507,7 @@ pub fn refresh_family(b: &[u8], n: &Negotiated) -> Result<Option<bool>> {
         _ => Ok(None),
     }
 }
+/// Describe a peer NOTIFICATION without triggering a reply, or create a state error.
 pub fn unexpected(kind: u8, body: &[u8]) -> anyhow::Error {
     if kind == 3 {
         if body.len() >= 2 {
@@ -498,6 +527,7 @@ pub fn unexpected(kind: u8, body: &[u8]) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Pair the example configuration with a peer and dual-stack, four-octet negotiation.
     fn fixture() -> (Config, Peer, Negotiated) {
         let c: Config = toml::from_str(include_str!("../examples/ubgp.toml")).unwrap();
         let p = c.peers[0].clone();
@@ -573,7 +603,7 @@ mod tests {
         let (c, mut p, n) = fixture();
         p.next_hop_v6 = Some("2001:db8::1".parse().unwrap());
         p.next_hop_v6_link_local = Some("fe80::1".parse().unwrap());
-        let prefixes = vec!["2001:db8::ff/128".parse().unwrap(); 200];
+        let prefixes = vec!["2001:db8::ff/128".parse().unwrap(); MAX_UPDATE_PREFIXES];
         for withdraw in [false, true] {
             let msg = update(&c, &p, &n, &prefixes, withdraw);
             assert!(msg.len() <= MAX_MESSAGE);

@@ -27,6 +27,7 @@ const NLM_F_DUMP_INTR: u16 = 0x10;
 const SOL_NETLINK: i32 = 270;
 const NETLINK_GET_STRICT_CHK: i32 = 12;
 
+/// Round a netlink message or attribute length up to its four-byte boundary.
 fn align(n: usize) -> usize {
     (n + 3) & !3
 }
@@ -41,6 +42,8 @@ struct Socket {
     fd: OwnedFd,
 }
 impl Socket {
+    /// Open a nonblocking route socket with the requested receive buffer and groups.
+    /// A zero group mask creates a socket for dumps without multicast subscriptions.
     fn open(groups: u32, buffer: usize) -> Result<Self> {
         // SAFETY: socket has no pointer arguments; a successful descriptor is owned here.
         let fd = unsafe {
@@ -115,6 +118,8 @@ impl Socket {
         }
         Ok(())
     }
+    /// Receive one kernel datagram, rejecting truncation and non-kernel senders.
+    /// Return `WouldBlock` when no datagram is queued.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: all pointers describe live writable storage. recvmsg cannot write past iov_len.
         unsafe {
@@ -147,6 +152,7 @@ impl Socket {
             Ok(n as usize)
         }
     }
+    /// Request a family/table route dump tagged with the supplied sequence number.
     fn request(&self, seq: u32, family: u8, table: u32) -> Result<()> {
         let mut req = [0u8; 36];
         req[..4].copy_from_slice(&36u32.to_ne_bytes());
@@ -185,6 +191,7 @@ struct Message<'a> {
     seq: u32,
     payload: &'a [u8],
 }
+/// Walk aligned messages in a datagram, rejecting malformed lengths and padding.
 fn messages(mut bytes: &[u8], mut f: impl FnMut(Message<'_>) -> Result<()>) -> Result<()> {
     while !bytes.is_empty() {
         ensure!(bytes.len() >= HEADER, "short netlink header");
@@ -208,6 +215,8 @@ fn messages(mut bytes: &[u8], mut f: impl FnMut(Message<'_>) -> Result<()>) -> R
     Ok(())
 }
 
+/// Decode a destination-only unicast prefix from a selected table.
+/// Return `None` for excluded routes and an error for malformed supported payloads.
 fn route(payload: &[u8], tables: &[u32]) -> Result<Option<IpNet>> {
     ensure!(payload.len() >= 12, "short rtmsg");
     let family = payload[0];
@@ -268,6 +277,7 @@ struct Events {
     lost: bool,
     datagrams: u64,
 }
+/// Consume a bounded notification batch, coalescing changes and detecting data loss.
 fn drain(events: &Socket, buf: &mut [u8]) -> Events {
     let mut result = Events::default();
     // Bound each pass for fairness with dump processing, shutdown and stale timers.
@@ -303,6 +313,7 @@ fn drain(events: &Socket, buf: &mut [u8]) -> Events {
     result
 }
 
+/// Wait for notification or dump activity, tolerating signals but rejecting closed sockets.
 fn poll(events: &Socket, dump: Option<&Socket>, millis: i32) -> Result<()> {
     let mut fds = [
         libc::pollfd {
@@ -329,6 +340,7 @@ fn poll(events: &Socket, dump: Option<&Socket>, millis: i32) -> Result<()> {
     Ok(())
 }
 
+/// Validate dump completion, accepting ENOENT only when no routes were received.
 fn dump_status(payload: &[u8], saw_route: bool) -> Result<()> {
     if payload.is_empty() {
         return Ok(());
@@ -343,6 +355,8 @@ fn dump_status(payload: &[u8], saw_route: bool) -> Result<()> {
     Ok(())
 }
 
+/// Collect complete selected-table dumps within the time and prefix limits.
+/// The flag reports concurrent route changes; notification loss discards the snapshot.
 fn snapshot(
     cfg: &Config,
     events: &Socket,
@@ -441,6 +455,8 @@ fn snapshot(
     Ok((result, changed || ev.changed))
 }
 
+/// Build one shared prefix set per referenced export ACL from a kernel snapshot.
+/// Requires validated configuration so every peer's ACL exists.
 pub fn filter(cfg: &Config, prefixes: &Prefixes) -> Exports {
     cfg.peers
         .iter()
@@ -469,9 +485,11 @@ struct Freshness {
     withdrawn: bool,
 }
 impl Freshness {
+    /// Start the stale deadline without extending an already pending invalidation.
     fn invalidate(&mut self, now: Instant) {
         self.dirty_since.get_or_insert(now);
     }
+    /// Withdraw exports once the pending invalidation reaches the stale limit.
     fn expire(&mut self, now: Instant, limit: Duration, tx: &watch::Sender<Arc<Exports>>) {
         if !self.withdrawn
             && self
@@ -483,6 +501,7 @@ impl Freshness {
             warn!("kernel state stale; withdrawing all exports until a complete dump succeeds");
         }
     }
+    /// Publish a complete export and clear staleness, unless concurrent changes need a refresh.
     fn publish(
         &mut self,
         now: Instant,
@@ -503,6 +522,7 @@ struct Watchdog {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Drop for Watchdog {
+    /// Wake and join the stale-state watchdog before releasing its owner.
     fn drop(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -512,6 +532,9 @@ impl Drop for Watchdog {
     }
 }
 
+/// Reconcile kernel routes into ACL exports until stopped, retrying incomplete dumps.
+/// An independent watchdog withdraws exports when kernel state stays stale.
+///
 /// All memory queues are constant-size; route storage is capped by max_prefixes.
 /// Watch channels retain only the latest complete export, shared among peers.
 pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBool>) -> Result<()> {
@@ -521,9 +544,9 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
     let mut buf = vec![0u8; 256 * 1024];
     let mut seq = 0;
     let mut due = Instant::now();
-    let mut dirty_since = Some(due);
+    let mut dirty = true;
     let freshness = Arc::new(Mutex::new(Freshness {
-        dirty_since,
+        dirty_since: Some(due),
         withdrawn: false,
     }));
     // Independent deadline enforcement, including while a dump is blocked or
@@ -558,7 +581,7 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
         datagrams += ev.datagrams;
         let now = Instant::now();
         if ev.changed || ev.lost || now >= periodic {
-            dirty_since.get_or_insert(now);
+            dirty = true;
             freshness.lock().unwrap().invalidate(now);
             if ev.lost {
                 losses += 1;
@@ -568,7 +591,7 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
                 );
             }
         }
-        if dirty_since.is_some() && now >= due {
+        if dirty && now >= due {
             let started = Instant::now();
             match snapshot(&cfg, &events, &stop, &mut buf, &mut seq) {
                 Ok((prefixes, changed)) => {
@@ -602,7 +625,7 @@ pub fn run(cfg: Arc<Config>, tx: watch::Sender<Arc<Exports>>, stop: Arc<AtomicBo
                     );
                     retries = 0;
                     let end = Instant::now();
-                    dirty_since = changed.then_some(end);
+                    dirty = changed;
                     periodic = end + Duration::from_secs(cfg.kernel.reconcile_interval_secs);
                     due = end + Duration::from_millis(cfg.kernel.refresh_interval_ms);
                 }
@@ -655,6 +678,7 @@ mod tests {
         health.expire(now + Duration::from_secs(100), Duration::from_secs(3), &tx);
         assert_eq!(*rx.borrow(), exports);
     }
+    /// Build a unicast rtmsg payload with explicit table and destination attributes.
     fn rt(table: u32, prefix: &str) -> Vec<u8> {
         let net: IpNet = prefix.parse().unwrap();
         let ip = match net.addr() {

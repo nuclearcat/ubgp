@@ -2,6 +2,7 @@ use crate::{
     config::{Config, Peer},
     management::{self, Status},
     netlink::{Exports, Prefixes},
+    transport::endpoint,
     wire::{self, Negotiated, ProtocolError},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -10,7 +11,7 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{CStr, CString},
-    net::{IpAddr, SocketAddr, SocketAddrV6},
+    net::IpAddr,
     sync::Arc,
     time::Duration,
 };
@@ -23,6 +24,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+/// Resolve the peering interface to its kernel index, failing if it is absent.
 fn index(p: &Peer) -> Result<u32> {
     let name = CString::new(p.interface.as_str())?;
     // SAFETY: name is a terminated C string for the duration of the call.
@@ -30,14 +32,7 @@ fn index(p: &Peer) -> Result<u32> {
     ensure!(n != 0, "interface {} does not exist", p.interface);
     Ok(n)
 }
-fn endpoint(ip: IpAddr, port: u16, index: u32) -> SocketAddr {
-    match ip {
-        IpAddr::V6(a) if a.is_unicast_link_local() => {
-            SocketAddr::V6(SocketAddrV6::new(a, port, 0, index))
-        }
-        _ => SocketAddr::new(ip, port),
-    }
-}
+/// Bind traffic to the peering interface, limit it to one hop, and disable Nagle.
 fn configure(socket: &SockRef<'_>, p: &Peer) -> Result<()> {
     socket
         .bind_device(Some(p.interface.as_bytes()))
@@ -51,6 +46,8 @@ fn configure(socket: &SockRef<'_>, p: &Peer) -> Result<()> {
     Ok(())
 }
 
+/// Verify local and next-hop addresses and return an interface link-local address.
+///
 /// Explicit next-hop overrides must still be addresses belonging to this router
 /// on the peering interface. Configuration cannot silently become third-party NH.
 fn check_local_addresses(p: &Peer) -> Result<Option<std::net::Ipv6Addr>> {
@@ -125,6 +122,7 @@ fn check_local_addresses(p: &Peer) -> Result<Option<std::net::Ipv6Addr>> {
     }))
 }
 
+/// Connect from the configured local address with optional TCP-MD5 and a deadline.
 async fn connect(p: &Peer) -> Result<TcpStream> {
     info!(peer = %p.address, local = %p.local_address, interface = %p.interface, port = p.port, md5 = p.md5_password.is_some(), "BGP Connect: starting outgoing TCP connection");
     let idx = index(p)?;
@@ -146,12 +144,14 @@ async fn connect(p: &Peer) -> Result<TcpStream> {
     .with_context(|| format!("TCP connect timed out after {}s", p.connect_timeout_secs))?
     .context("TCP connect failed")
 }
+/// Write a complete packet within the deadline; an error may leave a partial frame.
 async fn send(writer: &mut (impl AsyncWrite + Unpin), packet: &[u8], seconds: u64) -> Result<()> {
     timeout(Duration::from_secs(seconds), writer.write_all(packet))
         .await
         .context("BGP write deadline exceeded")??;
     Ok(())
 }
+/// Best-effort send a NOTIFICATION for protocol errors, allowing at most one second.
 async fn report(writer: &mut (impl AsyncWrite + Unpin), error: &anyhow::Error) {
     if let Some(e) = error.downcast_ref::<ProtocolError>() {
         let _ = send(writer, &wire::notification(e.code, e.subcode, &e.data), 1).await;
@@ -163,6 +163,8 @@ struct Candidate {
     incoming: bool,
     link_local: Option<std::net::Ipv6Addr>,
 }
+/// Check local addresses and exchange OPENs within the connection timeout.
+/// The returned candidate still needs KEEPALIVE confirmation to become established.
 async fn handshake(
     mut stream: TcpStream,
     cfg: Arc<Config>,
@@ -196,6 +198,8 @@ async fn handshake(
     }
 }
 
+/// Select an incoming or outgoing OPEN candidate using the router-ID preference.
+/// Allow a short collision window for the other direction; abort unused candidates.
 async fn choose(
     cfg: Arc<Config>,
     p: Peer,
@@ -259,6 +263,8 @@ async fn choose(
     // Dropping JoinSet aborts all unused candidates and closes their sockets.
 }
 
+/// Validate inbound messages and signal refreshes without importing routes.
+/// Only complete, valid UPDATEs and KEEPALIVEs reset the negotiated hold timer.
 async fn receive(
     reader: &mut (impl AsyncRead + Unpin),
     n: &Negotiated,
@@ -300,12 +306,12 @@ async fn receive(
     }
 }
 
-#[derive(Default)]
 struct Plan {
     withdrawals: VecDeque<IpNet>,
     additions: VecDeque<IpNet>,
 }
 impl Plan {
+    /// Diff against sent routes, gate additions by negotiated family, and replay on refresh.
     fn new(advertised: &Prefixes, desired: &Prefixes, n: &Negotiated, refresh: bool) -> Self {
         let enabled = |p: &IpNet| if p.addr().is_ipv4() { n.ipv4 } else { n.ipv6 };
         let mut plan = Self {
@@ -329,6 +335,8 @@ impl Plan {
             .sort_unstable_by_key(|p| p.addr().is_ipv6());
         plan
     }
+    /// Take a bounded batch of one address family, draining withdrawals before additions.
+    /// The returned flag is true for withdrawals.
     fn next(&mut self) -> Option<(bool, Vec<IpNet>)> {
         let withdraw = !self.withdrawals.is_empty();
         let queue = if withdraw {
@@ -337,21 +345,22 @@ impl Plan {
             &mut self.additions
         };
         let v6 = queue.front()?.addr().is_ipv6();
-        let mut batch = Vec::with_capacity(200);
-        while batch.len() < 200 && queue.front().is_some_and(|p| p.addr().is_ipv6() == v6) {
+        let mut batch = Vec::with_capacity(wire::MAX_UPDATE_PREFIXES);
+        while batch.len() < wire::MAX_UPDATE_PREFIXES
+            && queue.front().is_some_and(|p| p.addr().is_ipv6() == v6)
+        {
             batch.push(queue.pop_front().unwrap());
         }
         Some((withdraw, batch))
     }
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.withdrawals.is_empty() && self.additions.is_empty()
-    }
 }
+/// Mark the latest snapshot seen and select the ACL's exports, defaulting to empty.
 fn desired(rx: &mut watch::Receiver<Arc<Exports>>, acl: &str) -> Arc<Prefixes> {
     rx.borrow_and_update().get(acl).cloned().unwrap_or_default()
 }
 
+/// Send export changes, refresh replays, end-of-RIB markers, and timed KEEPALIVEs.
+/// Replan from successfully written routes when snapshots change during transmission.
 async fn transmit(
     writer: &mut (impl AsyncWrite + Unpin),
     cfg: &Config,
@@ -431,6 +440,8 @@ async fn transmit(
     }
 }
 
+/// Confirm the OPEN candidate, then drive receive and transmit until either stops.
+/// Fill an omitted link-local next hop from the interface and expose session status.
 async fn session(
     status: Status,
     mut candidate: Candidate,
@@ -504,6 +515,7 @@ async fn session(
     result
 }
 
+/// Maintain one peer session with bounded outbound backoff and incoming acceptance.
 async fn peer_loop(
     status: Status,
     cfg: Arc<Config>,
@@ -575,6 +587,8 @@ async fn peer_loop(
     }
 }
 
+/// Run peer workers and shared listeners, dispatching only configured remote addresses.
+/// `statuses` must correspond to `cfg.peers` in order; any worker exit ends this task.
 pub async fn run(
     cfg: Arc<Config>,
     exports: watch::Receiver<Arc<Exports>>,
@@ -636,14 +650,15 @@ pub async fn run(
         info!(%local, %interface, port = cfg.listen_port, "listening for configured BGP peers");
         tasks.spawn(async move {
             loop {
-                let (stream, remote) = listener.accept().await?;
+                let (stream, remote) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => return Err(error.into()),
+                };
                 if let Some(tx) = peers.get(&remote.ip()) {
                     let _ = tx.try_send(stream);
                 }
                 // Unconfigured sources and full per-peer queues are simply closed.
             }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
         });
     }
     tasks.join_next().await.context("no BGP tasks")??
@@ -702,7 +717,7 @@ mod tests {
             plan.next(),
             Some((false, vec!["10.2.0.0/24".parse().unwrap()]))
         );
-        assert!(plan.is_empty());
+        assert_eq!(plan.next(), None);
         let refresh = Plan::new(&advertised, &desired, &n(), true);
         assert_eq!(refresh.withdrawals.len(), 1);
         assert_eq!(refresh.additions.len(), 2);

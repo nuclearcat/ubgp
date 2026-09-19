@@ -13,6 +13,7 @@ use ubgp::{bgp, config::Config, management, netlink};
 mod cli;
 mod daemon;
 
+/// Validate startup arguments and configuration, then detach before creating threads.
 fn main() -> Result<()> {
     let (path, background, debug, check) = match cli::parse(std::env::args_os().skip(1))? {
         cli::Command::Help => {
@@ -54,6 +55,8 @@ fn main() -> Result<()> {
     result
 }
 
+/// Supervise kernel, BGP, and console workers until shutdown or a fatal worker exit.
+/// SIGHUP restarts workers with validated configuration; invalid reloads keep the old one.
 async fn run(path: PathBuf, mut config: Config) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut hup = signal(SignalKind::hangup())?;

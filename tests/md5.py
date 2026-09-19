@@ -11,6 +11,7 @@ BETA = "ubgp-test-beta"
 
 
 def blocked(label, control):
+    """Assert the peer stays unestablished across the connection retry window."""
     # Cover BIRD's one-second connect delay and ubgp's three-second timeout.
     end = time.monotonic() + 4
     while time.monotonic() < end:
@@ -20,11 +21,13 @@ def blocked(label, control):
 
 
 def reconnect(lab, label):
+    """Wait for session establishment and authenticated route transfer."""
     wait_for(label, lambda: "Established" in lab.control("show protocols all ubgp"))
     wait_for("authenticated route transfer", lambda: lab.has("10.1.0.0/24"))
 
 
 def rotation(lab):
+    """Verify reload rejects the old key and supports key replacement and removal."""
     lab.configure(mode="incoming", md5_password=ALPHA, bird_password=ALPHA)
     config = lab.path / "ubgp.toml"
     bird = lab.path / "bird.conf"
@@ -44,6 +47,7 @@ def rotation(lab):
 
 
 def shared_listener(lab):
+    """Check distinct keys and an unsigned peer coexist on one listener without key reuse."""
     lab.configure(mode="incoming", md5_password=ALPHA, bird_password=ALPHA)
     run("ip", "route", "add", "192.0.2.0/24", "dev", "ubgp0")
     extra = []
@@ -78,6 +82,7 @@ protocol bgp ubgp {{
                             "-c", str(config), "-s", str(control), "-P", str(lab.path / f"bird-{number}.pid"))
 
         def command(text, process=process, control=control):
+            """Query this loop iteration's BIRD instance once its control socket exists."""
             assert process.poll() is None, "extra BIRD process exited"
             if not control.exists():
                 return ""
